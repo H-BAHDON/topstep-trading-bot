@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from strategies.ema_cross import StrategyResult
+from strategies.base import StrategyResult
 from topstep_api import Candle
 
 

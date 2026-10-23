@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from strategies.ema_cross import StrategyResult
+from strategies.base import StrategyResult
 from topstep_api import ProjectX, ProjectXError, now_utc
 
 UTC = timezone.utc
@@ -23,6 +23,10 @@ ENTRY_SIGNALS = {
     "SHORT_CROSS": 1,
     "SHORT_PULLBACK": 1,
     "SHORT_TOUCH": 1,
+    "LONG_HOURLY": 0,
+    "SHORT_HOURLY": 1,
+    "LONG_HOURLY_43": 0,
+    "SHORT_HOURLY_43": 1,
 }
 OPEN_OR_PENDING_STATUSES = {1, 6}
 FILLED_STATUS = 2
@@ -113,7 +117,9 @@ class TradingConfig:
         elif bracket_mode == "position":
             errors.append(POSITION_BRACKETS_API_UNSUPPORTED)
 
-        strategy_name = os.getenv("ACTIVE_STRATEGY", "ema_cross").strip().lower()
+        strategy_name = os.getenv(
+            "ACTIVE_STRATEGY", "ema12_hourly_trailing"
+        ).strip().lower()
         contracts = 0
         stop_loss_points = Decimal(0)
         if strategy_name == "quick_scalp":
@@ -166,6 +172,53 @@ class TradingConfig:
                 trail_distance_ticks = int(distance_ticks)
             trail_management_mode = "native_delayed"
             take_profit_points = None
+            broker_max_contracts = None
+        elif strategy_name in {
+            "ema12_hourly_trailing",
+            "ema12_hourly_trailing_43",
+        }:
+            def strategy_integer(name: str, default: str) -> int:
+                try:
+                    value = int(os.getenv(name, default))
+                    if value <= 0:
+                        raise ValueError
+                    return value
+                except ValueError:
+                    errors.append(f"{name} must be an integer >= 1")
+                    return 0
+
+            def strategy_decimal(name: str, default: str) -> Decimal:
+                try:
+                    value = Decimal(os.getenv(name, default))
+                    if not value.is_finite() or value <= 0:
+                        raise InvalidOperation
+                    return value
+                except InvalidOperation:
+                    errors.append(f"{name} must be a positive number")
+                    return Decimal(0)
+
+            contracts = strategy_integer("EMA12_HOURLY_CONTRACTS", "5")
+            stop_loss_points = strategy_decimal(
+                "EMA12_HOURLY_HARD_STOP_POINTS", "40"
+            )
+            take_profit_points = strategy_decimal(
+                "EMA12_HOURLY_TAKE_PROFIT_POINTS", "25"
+            )
+            trail_activation_points = strategy_decimal(
+                "EMA12_HOURLY_TRAIL_ACTIVATION_POINTS", "10"
+            )
+            trail_distance_points = strategy_decimal(
+                "EMA12_HOURLY_TRAIL_DISTANCE_POINTS", "5"
+            )
+            distance_ticks = trail_distance_points / Decimal("0.25")
+            if distance_ticks != distance_ticks.to_integral_value():
+                errors.append(
+                    "EMA12_HOURLY_TRAIL_DISTANCE_POINTS must convert to whole MNQ ticks"
+                )
+                trail_distance_ticks = 0
+            else:
+                trail_distance_ticks = int(distance_ticks)
+            trail_management_mode = "native_delayed"
             broker_max_contracts = None
         else:
             contracts = integer("CONTRACTS")
@@ -382,7 +435,7 @@ class ExecutionManager:
                 "ticks": self.signed_take_profit_ticks(entry_side),
                 "type": LIMIT_ORDER,
             }
-            if self.config.trail_management_mode == "fixed_oco"
+            if self.config.take_profit_points is not None
             else None
         )
         return {
@@ -424,6 +477,11 @@ class ExecutionManager:
                 errors.append("TRAIL_MANAGEMENT_MODE must be native_delayed")
             if min(self.stop_ticks, self.activation_ticks, self.trail_ticks) <= 0:
                 errors.append("stop and trailing points must convert to whole positive ticks")
+            if (
+                self.config.take_profit_points is not None
+                and self.take_profit_ticks <= 0
+            ):
+                errors.append("take-profit points must convert to whole positive ticks")
         if not self.practice_account_eligible(self.account):
             errors.append(
                 "selected account does not exactly match the intended practice account or lacks independent simulated-status verification"
@@ -625,13 +683,12 @@ class ExecutionManager:
             stop = self.find_protective_stop(position, orders)
             take_profit = (
                 self.find_take_profit(position, orders)
-                if self.config.trail_management_mode == "fixed_oco"
-                else None
+                if self.config.take_profit_points is not None else None
             )
             if stop is None:
                 self.halt("existing MNQ position has no unique confirmed protective stop")
-            elif self.config.trail_management_mode == "fixed_oco" and take_profit is None:
-                self.halt("existing Quick Scalp position has no unique confirmed take profit")
+            elif self.config.take_profit_points is not None and take_profit is None:
+                self.halt("existing position has no unique confirmed take profit")
             else:
                 self.confirmed_stop_price = Decimal(str(stop["stopPrice"]))
                 self.confirmed_stop_order_id = int(stop["id"])
@@ -814,7 +871,12 @@ class ExecutionManager:
         if not entry_eligible:
             return "RECONNECT_REPLAY_BLOCKED"
         if not market_fresh:
-            self.halt("market data is stale")
+            logging.warning(
+                "SIGNAL SKIPPED signal=%s candle=%s reason=MARKET_DATA_STALE; "
+                "waiting for a fresh live quote without halting future entries",
+                result.signal,
+                result.candle.time.isoformat(),
+            )
             return "STALE_MARKET_BLOCKED"
         if self.halted_reason:
             code = self.halted_code or self.halt_reason_code(self.halted_reason)
@@ -941,7 +1003,7 @@ class ExecutionManager:
         pre_entry_order_ids: set[int],
     ) -> bool:
         """Confirm a fixed-OCO trade that opened and closed between REST snapshots."""
-        if self.config.trail_management_mode != "fixed_oco":
+        if self.config.take_profit_points is None:
             return False
         account_id = int(self.account["id"])
         related = [
@@ -1087,11 +1149,10 @@ class ExecutionManager:
                 )
                 take_profit = (
                     self.find_take_profit(position, mnq_orders, pre_entry_order_ids)
-                    if self.config.trail_management_mode == "fixed_oco"
-                    else None
+                    if self.config.take_profit_points is not None else None
                 )
                 protection_complete = stop is not None and (
-                    self.config.trail_management_mode != "fixed_oco"
+                    self.config.take_profit_points is None
                     or take_profit is not None
                 )
                 if protection_complete:
@@ -1776,13 +1837,14 @@ class ExecutionManager:
             self.confirmed_position_id = int(position["id"])
             self.confirmed_position_type = int(position["type"])
             self.confirmed_position_size = int(position["size"])
-            if self.config.trail_management_mode == "fixed_oco":
+            if self.config.take_profit_points is not None:
                 take_profit = self.find_take_profit(position, orders)
                 if take_profit is None:
                     self.halt("protective take profit missing or ambiguous")
                     return "PROTECTION_UNCERTAIN"
                 self.confirmed_take_profit_order_id = int(take_profit["id"])
-                return "FIXED_OCO_ACTIVE"
+                if self.config.trail_management_mode == "fixed_oco":
+                    return "FIXED_OCO_ACTIVE"
             return await self.activate_native_trailing(position, orders)
         self.last_positions = []
         return "FLAT"

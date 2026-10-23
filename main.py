@@ -7,17 +7,17 @@ import logging
 import os
 import signal
 import time
-from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
 from execution import ExecutionManager, TradingConfig
-from strategies.ema_cross import EmaCrossStrategy, StrategyResult
+from strategies.base import StrategyResult
 from strategies.test_long import TestLongStrategy
-from strategies.quick_scalp import QuickScalpStrategy
-from strategies.ema_touch_reentry import EmaTouchReentryStrategy
+from strategies.ema12_hourly_trailing import Ema12HourlyTrailingStrategy, HourlyEmaResult
+from strategies.ema12_hourly_trailing_43 import Ema12HourlyTrailing43Strategy
 from telegram_monitor import TelegramMonitor
 from topstep_api import MarketDataFeed, ProjectX, ProjectXError, env_bool
 
@@ -46,10 +46,9 @@ def configure_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 STRATEGIES = {
-    "ema_cross": EmaCrossStrategy,
     "test_long": TestLongStrategy,
-    "quick_scalp": QuickScalpStrategy,
-    "ema_touch_reentry": EmaTouchReentryStrategy,
+    "ema12_hourly_trailing": Ema12HourlyTrailingStrategy,
+    "ema12_hourly_trailing_43": Ema12HourlyTrailing43Strategy,
 }
 
 
@@ -60,41 +59,28 @@ def select_strategy(name: str, entry_mode: str | None = None):
         raise ProjectXError(
             f"Unknown ACTIVE_STRATEGY={name!r}; choose one of: {available}"
         )
-    if strategy_class is QuickScalpStrategy:
+    if strategy_class in {
+        Ema12HourlyTrailingStrategy,
+        Ema12HourlyTrailing43Strategy,
+    }:
         try:
-            return strategy_class(entry_mode or "alternating")
-        except ValueError as exc:
-            raise ProjectXError(str(exc)) from exc
-    if strategy_class is EmaTouchReentryStrategy:
-        def optional_timestamp(variable: str) -> datetime | None:
-            raw = os.getenv(variable, "").strip()
-            if not raw:
-                return None
-            try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError as exc:
-                raise ProjectXError(
-                    f"{variable} must be an ISO-8601 timestamp"
-                ) from exc
-
-        try:
-            fast_length = int(os.getenv("EMA_TOUCH_FAST_LENGTH", "20"))
-            slow_length = int(os.getenv("EMA_TOUCH_SLOW_LENGTH", "50"))
-        except ValueError as exc:
-            raise ProjectXError("EMA touch lengths must be positive integers") from exc
-        if fast_length <= 0 or slow_length <= 0:
-            raise ProjectXError("EMA touch lengths must be positive integers")
-        return strategy_class(
-            fast_length=fast_length,
-            slow_length=slow_length,
-            enable_cross_entries=env_bool("EMA_TOUCH_ENABLE_CROSS_ENTRIES", True),
-            enable_touch_entries=env_bool("EMA_TOUCH_ENABLE_TOUCH_ENTRIES", True),
-            touch_blue_ema=env_bool("EMA_TOUCH_BLUE_EMA", True),
-            touch_red_ema=env_bool("EMA_TOUCH_RED_EMA", True),
-            use_date_filter=env_bool("EMA_TOUCH_USE_DATE_FILTER", False),
-            start_date=optional_timestamp("EMA_TOUCH_START_DATE"),
-            end_date=optional_timestamp("EMA_TOUCH_END_DATE"),
-        )
+            ema_length = int(os.getenv("EMA12_HOURLY_EMA_LENGTH", "12"))
+            timeframe = int(os.getenv("EMA12_HOURLY_TIMEFRAME_MINUTES", "15"))
+            return strategy_class(
+                ema_length=ema_length,
+                timeframe_minutes=timeframe,
+                start_time=strategy_class.parse_clock(
+                    os.getenv("EMA12_HOURLY_START_TIME", "00:00")
+                ),
+                end_time=strategy_class.parse_clock(
+                    os.getenv("EMA12_HOURLY_END_TIME", "20:00")
+                ),
+                timezone_name=os.getenv(
+                    "EMA12_HOURLY_TIMEZONE", "Europe/London"
+                ).strip(),
+            )
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise ProjectXError(f"Invalid ema12_hourly_trailing settings: {exc}") from exc
     return strategy_class()
 
 
@@ -169,7 +155,22 @@ def select_explicit_account(
     return selected
 
 
-def log_result(result: StrategyResult, execution_status: str) -> None:
+def log_result(result: StrategyResult | HourlyEmaResult, execution_status: str) -> None:
+    if isinstance(result, HourlyEmaResult):
+        logging.info(
+            "%s MNQ 15M %s signalTime=%s price=%.2f EMA%d=%.2f "
+            "relation=%s signal=%s execution=%s",
+            result.candle.time.strftime("[%H:%M]"),
+            "PARTIAL" if result.partial else "CLOSED",
+            result.signal_close_time.isoformat(),
+            result.candle.close,
+            12,
+            result.ema12,
+            result.trend,
+            result.signal or "NONE",
+            execution_status,
+        )
+        return
     logging.info(
         "%s MNQ CLOSED\n"
         "Price: %.2f\n"
@@ -196,7 +197,7 @@ async def async_main() -> None:
 
     live = env_bool("PROJECTX_LIVE_DATA", False)
     strategy = select_strategy(
-        os.getenv("ACTIVE_STRATEGY", "ema_cross").strip().lower(),
+        os.getenv("ACTIVE_STRATEGY", "ema12_hourly_trailing").strip().lower(),
         os.getenv("ENTRY_MODE", "alternating"),
     )
     trading_config = TradingConfig.from_env()
@@ -298,7 +299,7 @@ async def async_main() -> None:
         await execution.startup_check()
 
         async def on_closed_candle(candle, entry_eligible: bool) -> None:
-            if isinstance(strategy, (TestLongStrategy, QuickScalpStrategy)):
+            if isinstance(strategy, TestLongStrategy):
                 result = strategy.on_candle(
                     candle,
                     emit_signal=entry_eligible,
@@ -307,19 +308,11 @@ async def async_main() -> None:
                         and not execution.last_positions
                     ),
                 )
-            elif isinstance(strategy, EmaTouchReentryStrategy):
-                position_type = (
-                    int(execution.last_positions[0]["type"])
-                    if len(execution.last_positions) == 1
-                    else None
-                )
+            else:
                 result = strategy.on_candle(
                     candle,
                     emit_signal=entry_eligible,
-                    position_type=position_type,
                 )
-            else:
-                result = strategy.on_candle(candle)
             if result is None:
                 return
             status = await execution.signal(
@@ -327,11 +320,6 @@ async def async_main() -> None:
                 entry_eligible=entry_eligible,
                 market_fresh=feed.market_is_fresh(),
             )
-            if (
-                isinstance(strategy, QuickScalpStrategy)
-                and status == "FILLED_PROTECTED"
-            ):
-                strategy.entry_accepted(candle.time)
             log_result(result, status)
 
         loop = asyncio.get_running_loop()

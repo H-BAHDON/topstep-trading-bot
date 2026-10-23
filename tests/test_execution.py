@@ -14,7 +14,7 @@ from execution import (
     ExecutionManager,
     TradingConfig,
 )
-from strategies.ema_cross import StrategyResult
+from strategies.base import StrategyResult
 from topstep_api import Candle, ProjectXError
 
 UTC = timezone.utc
@@ -1346,6 +1346,18 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(blocked, "DAILY_LOSS_BLOCKED")
         self.assertEqual(loss_api.place_calls, [])
+
+    async def test_stale_signal_is_skipped_without_permanently_halting(self) -> None:
+        api = FakeApi()
+        manager = self.manager(api)
+
+        blocked = await manager.signal(
+            signal_result(), entry_eligible=True, market_fresh=False
+        )
+
+        self.assertEqual(blocked, "STALE_MARKET_BLOCKED")
+        self.assertIsNone(manager.halted_reason)
+        self.assertEqual(api.place_calls, [])
 
     async def test_disabled_daily_loss_limit_allows_entry(self) -> None:
         api = FakeApi()
