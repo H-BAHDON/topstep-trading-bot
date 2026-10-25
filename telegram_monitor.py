@@ -22,7 +22,11 @@ UTC = timezone.utc
 CHICAGO = ZoneInfo("America/Chicago")
 LONG_POSITION = 1
 SHORT_POSITION = 2
-COMMANDS = {"/start", "/stop", "/status", "/profit", "/trades", "/stats", "/help"}
+SETTING_COMMANDS = {"/contracts", "/trail_activation", "/trail_distance"}
+COMMANDS = {
+    "/start", "/stop", "/status", "/profit", "/trades", "/stats", "/help",
+    "/settings", *SETTING_COMMANDS,
+}
 HELP_TEXT = (
     "Available commands:\n"
     "/start - subscribe to trade notifications\n"
@@ -31,6 +35,10 @@ HELP_TEXT = (
     "/profit - open, daily and total P&L\n"
     "/trades - last 10 completed trade results\n"
     "/stats - completed trade statistics\n"
+    "/settings - current runtime trade settings\n"
+    "/contracts N - set contracts for future trades\n"
+    "/trail_activation N - set trailing activation points\n"
+    "/trail_distance N - set trailing distance points\n"
     "/help - show this help"
 )
 
@@ -55,13 +63,17 @@ def trading_day_key(value: datetime | None = None) -> str:
 @dataclass(frozen=True)
 class TelegramConfig:
     token: str
+    owner_chat_id: str = ""
 
     @classmethod
     def from_env(cls) -> TelegramConfig | None:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             return None
-        return cls(token=token)
+        return cls(
+            token=token,
+            owner_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+        )
 
 
 class SubscriberStore:
@@ -570,6 +582,13 @@ class TelegramMonitor:
                 f"Average winner: {money(average_win)}\n"
                 f"Average loser: {money(average_loss)}"
             )
+        if command == "/settings":
+            values = self.execution.runtime_settings()
+            return (
+                f"Contracts: {values['contracts']}\n"
+                f"Trail activation: {values['trail_activation']} points\n"
+                f"Trail distance: {values['trail_distance']} points"
+            )
         if command == "/help":
             return HELP_TEXT
         return HELP_TEXT
@@ -591,7 +610,8 @@ class TelegramMonitor:
         text = message.get("text")
         if not isinstance(text, str):
             return
-        command = text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+        parts = text.strip().split()
+        command = parts[0].split("@", 1)[0].lower() if parts else ""
         if command not in COMMANDS:
             return
         if command == "/stop":
@@ -600,6 +620,31 @@ class TelegramMonitor:
             return
         if not self.rate_limiter.allow(chat_id):
             await self.send_to(chat_id, "Too many requests. Please wait and try again.")
+            return
+        if command in SETTING_COMMANDS or command == "/settings":
+            if not self.config.owner_chat_id or chat_id != self.config.owner_chat_id:
+                await self.send_to(chat_id, "Not authorized")
+                return
+            if command == "/settings":
+                await self.send_to(chat_id, self.command_response(command))
+                return
+            if len(parts) != 2:
+                await self.send_to(chat_id, f"Usage: {command} VALUE")
+                return
+            setting = command.removeprefix("/")
+            try:
+                updated = await self.execution.update_runtime_setting(
+                    setting, parts[1]
+                )
+            except ValueError as exc:
+                await self.send_to(chat_id, f"Invalid value: {exc}")
+                return
+            label = setting.replace("_", " ").title()
+            suffix = "" if setting == "contracts" else " points"
+            await self.send_to(
+                chat_id,
+                f"{label} updated to {updated}{suffix}. Applies to future trades.",
+            )
             return
         if command == "/start":
             self.subscribers.add(chat_id)

@@ -310,6 +310,33 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
             POSITION_BRACKETS_API_UNSUPPORTED, blocked.readiness_errors()
         )
 
+    async def test_runtime_settings_are_used_for_future_entries(self) -> None:
+        manager = self.manager()
+        await manager.update_runtime_setting("contracts", "10")
+        await manager.update_runtime_setting("trail_activation", "25")
+        await manager.update_runtime_setting("trail_distance", "1")
+
+        payload = manager.build_entry_payload(0, "runtime-settings-test")
+        self.assertEqual(payload["size"], 10)
+        self.assertEqual(manager.config.trail_activation_points, Decimal("25"))
+        self.assertEqual(manager.activation_ticks, 100)
+        self.assertEqual(manager.trail_ticks, 4)
+        self.assertEqual(
+            manager.runtime_settings(),
+            {
+                "contracts": 10,
+                "trail_activation": "25",
+                "trail_distance": "1.00",
+            },
+        )
+
+    async def test_runtime_setting_validation(self) -> None:
+        manager = self.manager()
+        with self.assertRaises(ValueError):
+            await manager.update_runtime_setting("contracts", "0")
+        with self.assertRaises(ValueError):
+            await manager.update_runtime_setting("trail_distance", "0.1")
+
     def test_position_brackets_cannot_build_auto_oco_entry_payload(self) -> None:
         manager = ExecutionManager(
             FakeApi(), ACCOUNT, CONTRACT, config(bracket_mode="position")

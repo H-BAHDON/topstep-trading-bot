@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
@@ -300,6 +300,76 @@ class ExecutionManager:
         )
         self.activation_ticks = self.points_to_ticks(config.trail_activation_points)
         self.trail_ticks = config.trail_distance_ticks
+        self.active_trail_activation_points: Decimal | None = None
+        self.active_trail_ticks: int | None = None
+
+    async def update_runtime_setting(self, setting: str, value: str) -> str:
+        """Update the settings used for future entries without restarting."""
+        async with self.lock:
+            if setting == "contracts":
+                try:
+                    parsed_contracts = int(value)
+                    if parsed_contracts <= 0:
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError("contracts must be a positive integer") from exc
+                self.config = replace(self.config, contracts=parsed_contracts)
+                logging.info(
+                    "TELEGRAM SETTING UPDATED contracts=%d", parsed_contracts
+                )
+                return str(parsed_contracts)
+
+            try:
+                points = Decimal(value)
+                if not points.is_finite() or points <= 0:
+                    raise InvalidOperation
+            except InvalidOperation as exc:
+                raise ValueError("points must be a positive number") from exc
+            ticks = self.points_to_ticks(points)
+            if ticks <= 0:
+                raise ValueError(
+                    f"points must convert to whole {self.tick_size}-point MNQ ticks"
+                )
+            if setting == "trail_activation":
+                self.config = replace(
+                    self.config, trail_activation_points=points
+                )
+                self.activation_ticks = ticks
+            elif setting == "trail_distance":
+                self.config = replace(self.config, trail_distance_ticks=ticks)
+                self.trail_ticks = ticks
+            else:
+                raise ValueError("unknown runtime setting")
+            logging.info(
+                "TELEGRAM SETTING UPDATED %s=%s points ticks=%d",
+                setting,
+                points,
+                ticks,
+            )
+            return str(points)
+
+    def runtime_settings(self) -> dict[str, str | int]:
+        return {
+            "contracts": self.config.contracts,
+            "trail_activation": str(self.config.trail_activation_points),
+            "trail_distance": str(Decimal(self.trail_ticks) * self.tick_size),
+        }
+
+    @property
+    def position_trail_activation_points(self) -> Decimal:
+        return (
+            self.active_trail_activation_points
+            if self.active_trail_activation_points is not None
+            else self.config.trail_activation_points
+        )
+
+    @property
+    def position_trail_ticks(self) -> int:
+        return (
+            self.active_trail_ticks
+            if self.active_trail_ticks is not None
+            else self.trail_ticks
+        )
 
     def emit_event(self, event: str, **payload: Any) -> None:
         if self.event_sink is None:
@@ -698,6 +768,10 @@ class ExecutionManager:
                 self.confirmed_position_id = int(position["id"])
                 self.confirmed_position_type = int(position["type"])
                 self.confirmed_position_size = int(position["size"])
+                self.active_trail_activation_points = (
+                    self.config.trail_activation_points
+                )
+                self.active_trail_ticks = self.trail_ticks
                 if self.config.trail_management_mode == "native_delayed":
                     trailing_candidates = self.matching_exit_orders(
                         position, orders, TRAILING_STOP_ORDER
@@ -751,6 +825,8 @@ class ExecutionManager:
         self.confirmed_position_id = None
         self.confirmed_position_type = None
         self.confirmed_position_size = None
+        self.active_trail_activation_points = None
+        self.active_trail_ticks = None
         self.last_positions = []
 
     async def close_strategy_position(
@@ -950,6 +1026,10 @@ class ExecutionManager:
 
             side = ENTRY_SIGNALS[result.signal]
             try:
+                self.active_trail_activation_points = (
+                    self.config.trail_activation_points
+                )
+                self.active_trail_ticks = self.trail_ticks
                 payload = self.build_entry_payload(side, tag)
                 self.validate_stop_bracket_sign(
                     side, int(payload["stopLossBracket"]["ticks"])
@@ -1512,7 +1592,7 @@ class ExecutionManager:
         self, position: dict[str, Any], last_price: Decimal
     ) -> dict[str, Any]:
         position_type = int(position["type"])
-        distance = Decimal(self.trail_ticks) * self.tick_size
+        distance = Decimal(self.position_trail_ticks) * self.tick_size
         if position_type == LONG_POSITION:
             side = 1
             trail_price = self.quantize_stop(
@@ -1570,7 +1650,7 @@ class ExecutionManager:
             if int(position["type"]) == LONG_POSITION
             else entry_price - last_price
         )
-        if favorable_points < self.config.trail_activation_points:
+        if favorable_points < self.position_trail_activation_points:
             return "WAITING_FOR_TRAIL_ACTIVATION"
 
         payload = self.native_trailing_payload(position, last_price)
@@ -1619,7 +1699,7 @@ class ExecutionManager:
             "SELL" if payload["side"] == 1 else "BUY",
             payload["size"],
             payload["trailPrice"],
-            self.trail_ticks,
+            self.position_trail_ticks,
             self.confirmed_stop_order_id,
         )
         try:
@@ -1668,7 +1748,9 @@ class ExecutionManager:
                     position_id=position_id,
                     order_id=order_id,
                 )
-                expected_distance = Decimal(self.trail_ticks) * self.tick_size
+                expected_distance = (
+                    Decimal(self.position_trail_ticks) * self.tick_size
+                )
                 try:
                     broker_distance = Decimal(str(confirmed["trailPrice"]))
                 except (KeyError, InvalidOperation):
@@ -1691,7 +1773,7 @@ class ExecutionManager:
                         position_id,
                         order_id,
                         expected_distance,
-                        self.trail_ticks,
+                        self.position_trail_ticks,
                         broker_distance,
                         actual_ticks,
                         payload["trailPrice"],

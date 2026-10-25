@@ -88,6 +88,27 @@ class FakeExecution:
         self.contract = {"tickSize": 0.25, "tickValue": 0.5}
         self.account = {"id": 28648769}
         self.api = FakeBrokerApi()
+        self.settings = {
+            "contracts": 5,
+            "trail_activation": "25",
+            "trail_distance": "1",
+        }
+
+    async def update_runtime_setting(self, setting, value):
+        if setting == "contracts":
+            parsed = int(value)
+            if parsed <= 0:
+                raise ValueError("contracts must be a positive integer")
+            self.settings[setting] = parsed
+            return str(parsed)
+        parsed = Decimal(value)
+        if parsed <= 0 or parsed % Decimal("0.25"):
+            raise ValueError("points must convert to whole 0.25-point MNQ ticks")
+        self.settings[setting] = str(parsed)
+        return str(parsed)
+
+    def runtime_settings(self):
+        return dict(self.settings)
 
 
 def private_update(chat_id, command, update_id=1):
@@ -138,7 +159,30 @@ class TelegramMonitorTests(unittest.IsolatedAsyncioTestCase):
             {"TELEGRAM_BOT_TOKEN": "token", "TELEGRAM_CHAT_ID": "legacy"},
             clear=True,
         ):
-            self.assertEqual(TelegramConfig.from_env(), TelegramConfig("token"))
+            self.assertEqual(
+                TelegramConfig.from_env(), TelegramConfig("token", "legacy")
+            )
+
+    async def test_owner_can_update_runtime_settings_and_read_them(self) -> None:
+        self.monitor.config = TelegramConfig("secret-token", "9001")
+        await self.monitor.process_update(private_update(9001, "/contracts 10", 1))
+        await self.monitor.process_update(
+            private_update(9001, "/trail_activation 25", 2)
+        )
+        await self.monitor.process_update(
+            private_update(9001, "/trail_distance 1", 3)
+        )
+        await self.monitor.process_update(private_update(9001, "/settings", 4))
+        self.assertEqual(self.execution.settings["contracts"], 10)
+        self.assertEqual(self.execution.settings["trail_activation"], "25")
+        self.assertEqual(self.execution.settings["trail_distance"], "1")
+        self.assertIn("Contracts: 10", self.client.calls[-1][1]["text"])
+
+    async def test_non_owner_cannot_update_runtime_settings(self) -> None:
+        self.monitor.config = TelegramConfig("secret-token", "9001")
+        await self.monitor.process_update(private_update(9002, "/contracts 10"))
+        self.assertEqual(self.execution.settings["contracts"], 5)
+        self.assertEqual(self.client.calls[-1][1]["text"], "Not authorized")
 
     async def test_start_publicly_subscribes_and_persists_private_chat(self) -> None:
         await self.monitor.process_update(private_update(1001, "/start"))
