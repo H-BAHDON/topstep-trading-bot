@@ -1,4 +1,4 @@
-﻿"""ProjectX REST and SignalR market-data integration."""
+"""ProjectX REST and SignalR market-data integration."""
 from __future__ import annotations
 
 import asyncio
@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 API_URL = "https://api.topstepx.com"
 MARKET_HUB = "wss://rtc.topstepx.com/hubs/market"
@@ -143,9 +144,21 @@ class ProjectX:
         account_name: str,
         timeout_seconds: float = 10.0,
     ) -> dict[str, Any]:
-        """Independently verify simulated status through GatewayUserAccount."""
+        """Verify broker-reported simulated status from REST or the user hub."""
         if not self.token:
             raise ProjectXError("Cannot verify account without a session token")
+        # SubscribeAccounts may emit updates without an initial account snapshot.
+        # A fresh authenticated REST response can provide the same explicit flag.
+        snapshot = await self.accounts()
+        matches = [account for account in snapshot
+                   if str(account.get("id")) == str(account_id)]
+        if len(matches) != 1 or matches[0].get("name") != account_name:
+            raise ProjectXError("Account identity missing or ambiguous in verification snapshot")
+        verified = matches[0]
+        if "simulated" in verified:
+            if verified["simulated"] is not True:
+                raise ProjectXError("Broker account is not explicitly verified as simulated")
+            return verified
         url = f"{USER_HUB}?access_token={quote(self.token, safe='')}"
         try:
             async with websockets.connect(
@@ -175,48 +188,55 @@ class ProjectX:
                     json.dumps(invocation, separators=(",", ":"))
                     + RECORD_SEPARATOR
                 )
-                async with asyncio.timeout(timeout_seconds):
-                    async for raw in socket:
-                        for frame in str(raw).split(RECORD_SEPARATOR):
-                            if not frame:
-                                continue
-                            message = json.loads(frame)
-                            if not isinstance(message, dict):
-                                continue
-                            if message.get("type") == 7:
-                                raise ProjectXError(
-                                    "User hub closed during account verification"
-                                )
-                            if (
-                                message.get("type") != 1
-                                or message.get("target") != "GatewayUserAccount"
-                            ):
-                                continue
-                            arguments = message.get("arguments", [])
-                            if not isinstance(arguments, list) or not arguments:
-                                continue
-                            payloads = (
-                                arguments[0]
-                                if isinstance(arguments[0], list)
-                                else [arguments[0]]
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + timeout_seconds
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    raw = await asyncio.wait_for(socket.recv(), timeout=remaining)
+                    for frame in str(raw).split(RECORD_SEPARATOR):
+                        if not frame:
+                            continue
+                        message = json.loads(frame)
+                        if not isinstance(message, dict):
+                            continue
+                        if message.get("type") == 7:
+                            raise ProjectXError(
+                                "User hub closed during account verification"
                             )
-                            for account in payloads:
-                                if not isinstance(account, dict):
-                                    continue
-                                if (
-                                    str(account.get("id")) == str(account_id)
-                                    and account.get("name") == account_name
-                                ):
-                                    if account.get("simulated") is not True:
-                                        raise ProjectXError(
-                                            "selected account is not independently "
-                                            "verified as simulated"
-                                        )
-                                    return account
-        except TimeoutError as exc:
+                        if (
+                            message.get("type") != 1
+                            or message.get("target") != "GatewayUserAccount"
+                        ):
+                            continue
+                        arguments = message.get("arguments", [])
+                        if not isinstance(arguments, list) or not arguments:
+                            continue
+                        payloads = (
+                            arguments[0]
+                            if isinstance(arguments[0], list)
+                            else [arguments[0]]
+                        )
+                        for account in payloads:
+                            if not isinstance(account, dict):
+                                continue
+                            if (
+                                str(account.get("id")) == str(account_id)
+                                and account.get("name") == account_name
+                            ):
+                                if account.get("simulated") is not True:
+                                    raise ProjectXError(
+                                        "selected account is not independently "
+                                        "verified as simulated"
+                                    )
+                                return account
+        except (asyncio.TimeoutError, TimeoutError) as exc:
             raise ProjectXError(
                 "timed out waiting for simulated-status account verification"
             ) from exc
+        except ConnectionClosed as exc:
+            raise ProjectXError("User hub connection closed during account verification") from exc
         raise ProjectXError(
             "matching account was not returned by the user verification hub"
         )

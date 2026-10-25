@@ -108,7 +108,7 @@ class TradingConfig:
             poll_interval = 0.5
 
         enabled = boolean("ENABLE_ORDER_EXECUTION")
-        practice_only = boolean("PRACTICE_ONLY", required=True)
+        practice_only = boolean("PRACTICE_ONLY")
         emergency_halt = boolean("EMERGENCY_HALT")
         daily_loss_limit_enabled = boolean("ENABLE_DAILY_LOSS_LIMIT")
         bracket_mode = os.getenv("BRACKET_MODE", "").strip().lower()
@@ -263,11 +263,19 @@ class ExecutionManager:
         config: TradingConfig,
         quote_source: Any | None = None,
         event_sink: Any | None = None,
+        approved_account: tuple[int, str, str] | None = None,
+        entries_enabled: bool = True,
     ) -> None:
         self.api = api
         self.quote_source = quote_source or api
         self.event_sink = event_sink
         self.account = account
+        # Immutable identity from configuration, independent of process-wide env.
+        self.approved_account = approved_account
+        self.entries_enabled = entries_enabled
+        self.configured_entries_enabled = entries_enabled
+        self.runtime_paused = False
+        self.manual_close_uncertain = False
         self.contract = contract
         self.config = config
         self.lock = asyncio.Lock()
@@ -347,6 +355,65 @@ class ExecutionManager:
                 ticks,
             )
             return str(points)
+
+    def _pause_entries(self, persist) -> None:
+        self.entries_enabled = False
+        self.runtime_paused = True
+        persist(True)
+
+    async def pause_entries(self, persist) -> str:
+        async with self.lock:
+            self._pause_entries(persist)
+        return "Paused new entries. Open trades remain managed."
+
+    async def resume_entries(self, persist) -> str:
+        async with self.lock:
+            if not self.configured_entries_enabled:
+                raise ValueError("Account is disabled in accounts.json; enable it there and restart first")
+            if not self.config.enabled or self.readiness_errors():
+                raise ValueError("Account execution is disabled or safety checks are not ready")
+            if self.halted_reason or self.manual_close_uncertain or self.order_pending:
+                raise ValueError("Account is halted or has an uncertain/pending order; reconcile it before resuming")
+            positions, orders = await self.reconcile()
+            if len(positions) > 1 or (not positions and orders):
+                raise ValueError("Unresolved broker positions or orders prevent resuming")
+            if positions:
+                if self.find_protective_stop(positions[0], orders) is None:
+                    raise ValueError("Open position has no unique confirmed protective stop")
+                if (self.config.take_profit_points is not None
+                        and self.find_take_profit(positions[0], orders) is None):
+                    raise ValueError("Open position has no unique confirmed take profit")
+            net = await self.daily_net_pnl()
+            if self.config.daily_loss_limit_enabled and net <= -self.config.max_daily_loss_usd:
+                raise ValueError("Daily loss limit prevents resuming")
+            persist(False)
+            self.runtime_paused = False
+            self.entries_enabled = True
+        return "Resumed new entries. Existing risk and market checks still apply."
+
+    async def close_account(self, persist) -> str:
+        """Pause first; never blindly repeat an uncertain market close."""
+        async with self.lock:
+            self._pause_entries(persist)
+            if not self.account_eligible() or not self.config.enabled:
+                raise ValueError("Account identity or execution permission prevents closing")
+            positions, orders = await self.reconcile()
+            if len(positions) > 1 or self.order_pending:
+                raise ValueError("Multiple positions or a pending entry require broker review; account stays paused")
+            if positions:
+                if self.manual_close_uncertain:
+                    raise ValueError("Previous close is unconfirmed; inspect broker state before another close")
+                self.manual_close_uncertain = True
+                if not await self.close_strategy_position(positions[0], "TELEGRAM_CLOSE"):
+                    raise ValueError("Close was not confirmed; account stays paused. Inspect broker state")
+            elif not await self.cancel_and_confirm_orphan_exits(orders):
+                raise ValueError("Exit cleanup was not confirmed; account stays paused")
+            remaining_positions, remaining_orders = await self.reconcile()
+            if remaining_positions or remaining_orders:
+                raise ValueError("Broker still has positions or orders; account stays paused for review")
+            self.manual_close_uncertain = False
+            self.clear_tracked_position()
+        return "Confirmed flat with no remaining strategy-contract orders. Account stays paused."
 
     def runtime_settings(self) -> dict[str, str | int]:
         return {
@@ -552,8 +619,10 @@ class ExecutionManager:
                 and self.take_profit_ticks <= 0
             ):
                 errors.append("take-profit points must convert to whole positive ticks")
-        if not self.practice_account_eligible(self.account):
+        if not self.account_eligible():
             errors.append(
+                "configured account is unverified, mismatched, unavailable, or blocked by PRACTICE_ONLY"
+                if self.approved_account is not None else
                 "selected account does not exactly match the intended practice account or lacks independent simulated-status verification"
             )
         if self.contract.get("symbolId") != "F.US.MNQ":
@@ -570,12 +639,28 @@ class ExecutionManager:
             errors.append("EMERGENCY_HALT is active")
         return errors
 
+    def account_eligible(self) -> bool:
+        if self.approved_account is None:
+            return self.practice_account_eligible(self.account)
+        account_id, name, kind = self.approved_account
+        return (
+            kind in {"practice", "express"}
+            and (kind == "practice" or not self.config.practice_only)
+            and self.account.get("id") == account_id
+            and self.account.get("name") == name
+            and self.account.get("canTrade") is True
+            and self.account.get("isVisible") is True
+            and self.account.get("simulated") is True
+            and self.account.get("_simulatedVerified") is True
+        )
+
     @staticmethod
     def readiness_reason_code(error: str) -> str:
         mappings = (
             ("BRACKET_MODE=position", "BRACKET_MODE_POSITION_UNSUPPORTED"),
             ("EMERGENCY_HALT is active", "EMERGENCY_HALT_ACTIVE"),
             ("intended practice account", "PRACTICE_ACCOUNT_UNVERIFIED"),
+            ("configured account is unverified", "ACCOUNT_UNVERIFIED"),
             ("selected contract is not MNQ", "INVALID_CONTRACT"),
             ("CONTRACTS must be a positive integer", "INVALID_CONTRACT_SIZE"),
             ("MAX_OPEN_POSITIONS must be 1", "INVALID_POSITION_LIMIT"),
@@ -625,10 +710,10 @@ class ExecutionManager:
             self.halted_reason = reason
             self.halted_code = self.halt_reason_code(reason)
             logging.critical(
-                "NEW ORDERS HALTED reason=%s detail=%s. "
+                "NEW ORDERS HALTED accountId=%s reason=%s detail=%s. "
                 "Existing broker stop remains active; inspect the position "
                 "and orders in TopstepX.",
-                self.halted_code,
+                self.account["id"], self.halted_code,
                 reason,
             )
 
@@ -646,6 +731,7 @@ class ExecutionManager:
         )
         net = Decimal(0)
         for trade in trades:
+            self.validate_record_account(trade)
             if trade.get("voided"):
                 continue
             net += Decimal(str(trade.get("profitAndLoss") or 0))
@@ -682,7 +768,14 @@ class ExecutionManager:
             self.api.open_positions(account_id),
             self.api.open_orders(account_id),
         )
+        for record in [*positions, *orders]:
+            self.validate_record_account(record)
         return self.mnq_state(positions, orders)
+
+    def validate_record_account(self, record: dict[str, Any]) -> None:
+        """Reject a misrouted broker response rather than managing another account."""
+        if "accountId" in record and record["accountId"] != self.account["id"]:
+            raise ProjectXError("Broker response contains a different account ID")
 
     def matching_exit_orders(
         self,
@@ -735,9 +828,12 @@ class ExecutionManager:
         return candidates[0] if len(candidates) == 1 else None
 
     async def startup_check(self) -> None:
+        if self.approved_account is not None and not self.account_eligible():
+            self.halt("configured account is unverified or blocked by PRACTICE_ONLY")
+            return
         errors = self.readiness_errors()
         if errors:
-            logging.warning("Execution not ready: %s", "; ".join(errors))
+            logging.warning("Execution not ready accountId=%s: %s", self.account["id"], "; ".join(errors))
         try:
             positions, orders = await self.reconcile()
             net = await self.daily_net_pnl()
@@ -917,12 +1013,16 @@ class ExecutionManager:
         entry_eligible: bool,
         market_fresh: bool,
     ) -> str:
+        if self.approved_account is not None and not self.account_eligible():
+            return "SAFETY_BLOCKED reasons=ACCOUNT_UNVERIFIED"
         if result.signal == "DATE_RANGE_EXIT":
             return await self.strategy_date_exit(
                 result, entry_eligible=entry_eligible
             )
         if result.signal not in ENTRY_SIGNALS:
             return "NO_SIGNAL"
+        if not self.entries_enabled:
+            return "ACCOUNT_PAUSED"
         logging.info(
             "SIGNAL %s candle=%s price=%.2f",
             result.signal,
@@ -981,6 +1081,8 @@ class ExecutionManager:
             return "SAFETY_BLOCKED reasons=" + ",".join(reason_codes)
 
         async with self.lock:
+            if not self.entries_enabled:
+                return "ACCOUNT_PAUSED"
             if self.order_pending:
                 return "PENDING_BLOCKED"
             try:
@@ -1021,6 +1123,8 @@ class ExecutionManager:
             existing = await self.api.orders(
                 int(self.account["id"]), self.trading_day_start()
             )
+            for record in existing:
+                self.validate_record_account(record)
             if any(order.get("customTag") == tag for order in existing):
                 return "DUPLICATE_BLOCKED"
 
@@ -1038,8 +1142,8 @@ class ExecutionManager:
                 self.halt(f"invalid protective bracket payload: {exc}")
                 return "BRACKET_INVALID"
             logging.info(
-                "ENTRY REQUEST signal=%s side=%s size=%s tag=%s hardStopTicks=%d",
-                result.signal,
+                "ENTRY REQUEST accountId=%s signal=%s side=%s size=%s tag=%s hardStopTicks=%d",
+                self.account["id"], result.signal,
                 "BUY" if side == 0 else "SELL",
                 payload["size"],
                 tag,
@@ -1932,6 +2036,8 @@ class ExecutionManager:
         return "FLAT"
 
     async def monitor(self) -> None:
+        if self.approved_account is not None and not self.account_eligible():
+            return
         if not self.config.enabled:
             return
         loop = asyncio.get_running_loop()

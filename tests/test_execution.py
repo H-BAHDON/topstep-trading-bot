@@ -466,7 +466,7 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         for raw in ("0", "-1", "1.5", "invalid", ""):
             with self.subTest(raw=raw):
                 with patch.dict(
-                    os.environ, {"CONTRACTS": raw}, clear=True
+                    os.environ, {"CONTRACTS": raw, "ACTIVE_STRATEGY": "test_long"}, clear=True
                 ):
                     parsed = TradingConfig.from_env()
                 self.assertEqual(parsed.contracts, 0)

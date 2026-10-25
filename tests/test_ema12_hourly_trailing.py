@@ -22,7 +22,7 @@ def minute_bars(start: datetime, closes: list[float]) -> list[Candle]:
     ]
 
 
-class Ema12HourlyStrategyTests(unittest.TestCase):
+class Ema12HourlyStrategyTests(unittest.IsolatedAsyncioTestCase):
     def test_completed_15_minute_signal_and_duplicate_suppression(self):
         strategy = Ema12HourlyTrailingStrategy(ema_length=2)
         # 02:30 UTC is 03:30 UK during BST; this bar closes at 03:45 UK.
@@ -86,7 +86,7 @@ class Ema12HourlyStrategyTests(unittest.TestCase):
         self.assertEqual(config.trail_activation_points, Decimal("10"))
         self.assertEqual(config.trail_distance_ticks, 20)
 
-    def test_auto_oco_entry_has_long_and_short_protection(self):
+    async def test_auto_oco_entry_has_long_and_short_protection(self):
         config = TradingConfig(
             False, True, 5, "ema12_hourly_trailing", Decimal("40"),
             Decimal("25"), None, Decimal("10"), 20, "native_delayed",

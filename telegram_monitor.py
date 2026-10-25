@@ -1,4 +1,4 @@
-"""Optional public, read-only Telegram monitoring for the trading bot."""
+"""Telegram reporting with owner-only runtime account controls."""
 from __future__ import annotations
 
 import asyncio
@@ -36,9 +36,16 @@ HELP_TEXT = (
     "/trades - last 10 completed trade results\n"
     "/stats - completed trade statistics\n"
     "/settings - current runtime trade settings\n"
-    "/contracts N - set contracts for future trades\n"
-    "/trail_activation N - set trailing activation points\n"
-    "/trail_distance N - set trailing distance points\n"
+    "/accounts - owner: list accounts and entry status\n"
+    "/pause ACCOUNT - owner: pause new entries; manage open trades\n"
+    "/resume ACCOUNT - owner: resume after safety checks\n"
+    "/close ACCOUNT - owner: pause and close the strategy-contract position\n"
+    "/contracts ACCOUNT N - owner: set future contract size\n"
+    "/trail_activation ACCOUNT N - owner: set activation points\n"
+    "/trail_distance ACCOUNT N - owner: set trailing distance points\n"
+    "ACCOUNT can be its full configured name or broker ID.\n"
+    "Omit ACCOUNT for setting changes with one account.\n"
+    "Reports accept ACCOUNT or all; /profit all includes combined P&L.\n"
     "/help - show this help"
 )
 
@@ -732,3 +739,163 @@ class TelegramMonitor:
             self.running = False
             if self._owns_client and self.client is not None:
                 await self.client.aclose()
+
+
+class PauseStateStore:
+    """Durable per-account pause state, committed before enabling entries."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(path)) as connection:
+            connection.execute('CREATE TABLE IF NOT EXISTS pauses (account_id INTEGER PRIMARY KEY, paused INTEGER NOT NULL)')
+
+    def is_paused(self, account_id: int) -> bool:
+        with sqlite3.connect(str(self.path)) as connection:
+            row = connection.execute('SELECT paused FROM pauses WHERE account_id = ?', (account_id,)).fetchone()
+        if row is not None and row[0] not in (0, 1):
+            raise ValueError('Invalid saved account pause state')
+        return bool(row and row[0])
+
+    def set_paused(self, account_id: int, paused: bool) -> None:
+        with sqlite3.connect(str(self.path)) as connection:
+            connection.execute(
+                'INSERT INTO pauses(account_id, paused) VALUES (?, ?) '
+                'ON CONFLICT(account_id) DO UPDATE SET paused=excluded.paused',
+                (account_id, int(paused)),
+            )
+
+
+class AccountTelegramMonitor(TelegramMonitor):
+    """Single poller routing explicit account controls to isolated managers."""
+
+    peers: list[AccountTelegramMonitor]
+    pause_store: PauseStateStore
+
+    def account_label(self) -> str:
+        account = self.execution.account
+        return f"{account.get('_displayName', account.get('name', 'Account'))} ({account['id']})"
+
+    async def send_to(self, chat_id: str, text: str) -> bool:
+        return await super().send_to(chat_id, f"[{self.account_label()}]\n{text}")
+
+    def command_response(self, command: str) -> str:
+        response = super().command_response(command)
+        if command == '/status':
+            state = 'ACTIVE' if self.execution.entries_enabled else 'PAUSED'
+            response += f'\nNew entries: {state}'
+            if self.execution.halted_reason:
+                response += f'\nHalted: {self.execution.halted_reason}'
+        return response
+
+    async def poll_commands(self) -> None:
+        if self is self.peers[0]:
+            await super().poll_commands()
+
+    def select_peer(self, selector: str) -> AccountTelegramMonitor:
+        key = selector.casefold()
+        matches = [peer for peer in self.peers if key in {
+            str(peer.execution.account['id']).casefold(),
+            str(peer.execution.account.get('_displayName', '')).casefold(),
+            str(peer.execution.account.get('name', '')).casefold(),
+        }]
+        if len(matches) != 1:
+            raise ValueError('Account name/ID is unknown or ambiguous. Use /accounts to find its ID')
+        return matches[0]
+
+    async def combined_profit(self, chat_id: str) -> None:
+        refreshed = await asyncio.gather(*(peer.refresh_broker_pnl(force=True) for peer in self.peers))
+        if not all(refreshed) or any(peer.broker_pnl is None for peer in self.peers):
+            await self.send_to(chat_id, 'Combined P&L: Data unavailable for one or more accounts')
+            return
+        today = sum((peer.broker_pnl.today_net for peer in self.peers), Decimal(0))
+        total = sum((peer.broker_pnl.total_net for peer in self.peers), Decimal(0))
+        open_values = [peer.unrealized_pnl(peer.position_snapshot()) if peer.execution.last_positions
+                       else Decimal(0) for peer in self.peers]
+        open_text = money(sum(open_values, Decimal(0))) if all(value is not None for value in open_values) else 'Data unavailable'
+        await self.send_to(chat_id, f'Combined P&L ({len(self.peers)} accounts)\nOpen: {open_text}\n'
+                           f'Today realised: {money(today)}\nTotal realised: {money(total)}')
+
+    async def process_update(self, update: dict[str, Any]) -> None:
+        update_id = update.get('update_id')
+        if isinstance(update_id, int):
+            self.offset = update_id + 1
+        message = update.get('message')
+        if not isinstance(message, dict):
+            return
+        chat, text = message.get('chat'), message.get('text')
+        if not isinstance(chat, dict) or chat.get('type') != 'private' or not isinstance(text, str):
+            return
+        if not isinstance(chat.get('id'), (int, str)):
+            return
+        chat_id = str(chat['id'])
+        parts = text.strip().split()
+        command = parts[0].split('@', 1)[0].lower() if parts else ''
+        args = parts[1:]
+        controls = {'/accounts', '/pause', '/resume', '/close', '/settings', *SETTING_COMMANDS}
+        reports = {'/status', '/profit', '/trades', '/stats'}
+        if command not in controls and command not in reports:
+            for peer in self.peers:
+                await TelegramMonitor.process_update(peer, update)
+            return
+        if command in controls and (not self.config.owner_chat_id or chat_id != self.config.owner_chat_id):
+            await self.send_to(chat_id, 'Not authorized')
+            return
+        if not self.rate_limiter.allow(chat_id):
+            await self.send_to(chat_id, 'Too many requests. Please wait and try again.')
+            return
+        try:
+            if command == '/accounts':
+                if args:
+                    raise ValueError('Usage: /accounts')
+                rows = []
+                for peer in self.peers:
+                    execution = peer.execution
+                    status = 'ACTIVE' if execution.entries_enabled else 'PAUSED'
+                    if not execution.config.enabled:
+                        status = 'EXECUTION DISABLED'
+                    if execution.halted_reason:
+                        status += f' | HALTED: {execution.halted_reason}'
+                    rows.append(f'{peer.account_label()}: {status} | '
+                                f"Open contracts: {sum(int(p.get('size', 0)) for p in execution.last_positions)}")
+                await self.send_to(chat_id, '\n'.join(rows))
+                return
+            if command in {'/pause', '/resume', '/close'}:
+                if not args:
+                    raise ValueError(f'Usage: {command} ACCOUNT_NAME_OR_ID')
+                peer = self.select_peer(' '.join(args))
+                persist = lambda paused: self.pause_store.set_paused(peer.execution.account['id'], paused)
+                operation = {'/pause': peer.execution.pause_entries,
+                             '/resume': peer.execution.resume_entries,
+                             '/close': peer.execution.close_account}[command]
+                result = await operation(persist)
+                logging.info('Owner account control command=%s accountId=%s', command, peer.execution.account['id'])
+                await peer.send_to(chat_id, result)
+                return
+            if command in SETTING_COMMANDS:
+                if not args or (len(self.peers) > 1 and len(args) < 2):
+                    raise ValueError(f'Usage: {command} ACCOUNT_NAME_OR_ID VALUE')
+                peer = self.select_peer(' '.join(args[:-1])) if len(args) > 1 else self.peers[0]
+                value = await peer.execution.update_runtime_setting(command[1:], args[-1])
+                await peer.send_to(chat_id, f'{command[1:]} updated to {value}. Applies to future trades; resets on restart.')
+                return
+            selector = ' '.join(args)
+            if selector.casefold() == 'all' or not selector:
+                peers = self.peers
+            else:
+                peers = [self.select_peer(selector)]
+            for peer in peers:
+                if command in {'/profit', '/trades', '/stats'}:
+                    await peer.refresh_broker_pnl(force=True)
+                await peer.send_to(chat_id, peer.command_response(command))
+            if command == '/profit' and len(peers) > 1:
+                await self.combined_profit(chat_id)
+        except ValueError as exc:
+            await self.send_to(chat_id, f'Cannot apply command: {exc}')
+        except (OSError, sqlite3.Error):
+            logging.exception('Account pause state storage failed command=%s', command)
+            await self.send_to(chat_id, 'Pause state could not be saved. New entries remain blocked in memory; '
+                               'the saved state may differ after a restart. Check storage before restarting.')
+        except Exception:
+            logging.exception('Account command failed command=%s', command)
+            await self.send_to(chat_id, 'Command failed. Check /accounts and broker state before retrying. A pause/close target remains paused if pausing succeeded.')
