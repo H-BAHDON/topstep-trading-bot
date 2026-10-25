@@ -1,24 +1,27 @@
-﻿"""TopstepX MNQ strategy runner with practice-only, risk-gated execution."""
+"""TopstepX MNQ strategy runner with multi-account, risk-gated execution."""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
 import time
+from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from zoneinfo import ZoneInfoNotFoundError
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from execution import ExecutionManager, TradingConfig
 from strategies.base import StrategyResult
 from strategies.test_long import TestLongStrategy
 from strategies.ema12_hourly_trailing import Ema12HourlyTrailingStrategy, HourlyEmaResult
 from strategies.ema12_hourly_trailing_43 import Ema12HourlyTrailing43Strategy
-from telegram_monitor import TelegramMonitor
+from telegram_monitor import AccountTelegramMonitor, PauseStateStore
 from topstep_api import MarketDataFeed, ProjectX, ProjectXError, env_bool
 
 
@@ -92,7 +95,154 @@ def load_environment(path: str) -> Path:
     if selected != default and default.is_file():
         load_dotenv(default, override=False)
     load_dotenv(selected, override=True)
+    if os.getenv("ACCOUNTS_FILE", "").strip():
+        account_path = Path(os.environ["ACCOUNTS_FILE"]).expanduser()
+        if not account_path.is_absolute():
+            source = selected if "ACCOUNTS_FILE" in dotenv_values(selected) else default
+            account_path = source.parent / account_path
+        load_account_configuration(account_path)
+        os.environ["ACCOUNTS_FILE"] = str(account_path.resolve())
     return selected
+
+
+def load_account_configuration(path: Path) -> list[dict]:
+    """Validate all entries before contacting the broker. Never mutate account env."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+        accounts = document["accounts"]
+        if not isinstance(accounts, list) or not accounts:
+            raise ValueError("accounts must be a nonempty list")
+        ids, names = set(), set()
+        normalized = []
+        for entry in accounts:
+            if not isinstance(entry, dict):
+                raise ValueError("each account must be an object")
+            account = dict(entry)
+            account_id = account["account_id"]
+            if type(account_id) is not int or account_id <= 0 or account_id in ids:
+                raise ValueError("account_id must be a unique positive integer")
+            ids.add(account_id)
+            if type(account.get("enabled")) is not bool:
+                raise ValueError("enabled must be a boolean")
+            name = account.get("name")
+            if not isinstance(name, str) or not name.strip() or name.casefold() in names:
+                raise ValueError("name must be a unique nonempty string")
+            names.add(name.casefold())
+            kind = account.setdefault("account_type", "practice")
+            if kind not in {"practice", "express"}:
+                raise ValueError("account_type must be practice or express; Live is unsupported")
+            broker_name = account.get("account_name", account.get("verified_practice_account_name"))
+            if not isinstance(broker_name, str) or not broker_name.strip():
+                raise ValueError("account_name must contain the exact broker account name")
+            account["account_name"] = broker_name
+            verified_id = account.get("verified_practice_account_id")
+            if verified_id is not None and (type(verified_id) is not int or verified_id != account_id):
+                raise ValueError("verified practice account ID must match account_id")
+            verified = account.get("practice_account_simulated_verified", False)
+            if type(verified) is not bool:
+                raise ValueError("practice_account_simulated_verified must be a boolean")
+            if verified and (kind != "practice" or verified_id is None
+                             or account.get("verified_practice_account_name") != broker_name):
+                raise ValueError("explicit practice verification requires matching practice identity")
+            if "contracts" in account and (type(account["contracts"]) is not int or account["contracts"] <= 0):
+                raise ValueError("contracts must be a positive integer")
+            if "daily_loss_limit_enabled" in account and type(account["daily_loss_limit_enabled"]) is not bool:
+                raise ValueError("daily_loss_limit_enabled must be a boolean")
+            if "max_daily_loss_usd" in account:
+                limit = Decimal(str(account["max_daily_loss_usd"]))
+                if not limit.is_finite() or limit <= 0:
+                    raise ValueError("max_daily_loss_usd must be a positive finite number")
+            normalized.append(account)
+        return normalized
+    except (OSError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
+        raise ProjectXError(f"Invalid account configuration {path}: {exc}") from exc
+
+
+def configured_accounts() -> list[dict]:
+    if os.getenv("ACCOUNTS_FILE", "").strip():
+        return load_account_configuration(Path(os.environ["ACCOUNTS_FILE"]))
+    # Preserve deployments that still select a single practice account via .env.
+    try:
+        account_id = int(os.environ["TOPSTEP_ACCOUNT_ID"])
+    except (KeyError, ValueError) as exc:
+        raise ProjectXError("Set ACCOUNTS_FILE or TOPSTEP_ACCOUNT_ID") from exc
+    return [{
+        "name": "Practice", "enabled": True, "account_id": account_id,
+        "account_type": "practice",
+        "account_name": os.getenv("VERIFIED_PRACTICE_ACCOUNT_NAME", ""),
+        "verified_practice_account_id": (
+            account_id if os.getenv("VERIFIED_PRACTICE_ACCOUNT_ID") == str(account_id) else None
+        ),
+        "verified_practice_account_name": os.getenv("VERIFIED_PRACTICE_ACCOUNT_NAME", ""),
+        "practice_account_simulated_verified": env_bool("PRACTICE_ACCOUNT_SIMULATED_VERIFIED"),
+    }]
+
+
+def account_trading_config(base: TradingConfig, settings: dict) -> TradingConfig:
+    changes = {key: settings[key] for key in ("contracts", "daily_loss_limit_enabled") if key in settings}
+    if "max_daily_loss_usd" in settings:
+        changes["max_daily_loss_usd"] = Decimal(str(settings["max_daily_loss_usd"]))
+    return replace(base, **changes)
+
+
+async def verify_configured_account(api: ProjectX, accounts: list[dict], settings: dict) -> dict:
+    account = dict(select_explicit_account(accounts, str(settings["account_id"])))
+    if account.get("name") != settings["account_name"]:
+        raise ProjectXError(f"Account {settings['account_id']} does not match configured account_name")
+    account["_displayName"] = settings["name"]
+    account["_simulatedVerified"] = False
+    try:
+        verified = await api.verify_simulated_account(int(account["id"]), account["name"])
+        if (verified.get("id") != account["id"] or verified.get("name") != account["name"]
+                or verified.get("simulated") is not True):
+            raise ProjectXError("Account verification returned an inconsistent identity or simulated status")
+        account.update(verified)
+        account["_simulatedVerified"] = True
+    except ProjectXError as exc:
+        # Only the existing explicitly verified practice identity has a fallback.
+        if (settings["account_type"] == "practice"
+                and settings.get("practice_account_simulated_verified") is True
+                and settings.get("verified_practice_account_id") == account["id"]
+                and settings.get("verified_practice_account_name") == account["name"]
+                and account.get("simulated") is not False):
+            account.update(simulated=True, _simulatedVerified=True,
+                           _simulationVerificationSource="explicit_config")
+            logging.warning("Account %s using explicit practice verification: %s", account["id"], exc)
+        else:
+            logging.error("Account %s simulation verification failed: %s", account["id"], exc)
+    return account
+
+
+async def dispatch_signal(executions: list[ExecutionManager], result, **kwargs) -> dict[int, str]:
+    async def deliver(execution):
+        try:
+            status = await execution.signal(result, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            execution.halt("signal execution failed; broker state must be reconciled")
+            logging.exception("Signal failed accountId=%s", execution.account["id"])
+            status = "UNCERTAIN_BLOCKED"
+        logging.info("Signal result accountId=%s status=%s", execution.account["id"], status)
+        return int(execution.account["id"]), status
+    return dict(await asyncio.gather(*(deliver(execution) for execution in executions)))
+
+
+async def run_bot_tasks(feed_task, workers) -> None:
+    """Drain all workers before releasing account locks or closing the API."""
+    feed = asyncio.create_task(feed_task)
+    tasks = [feed, *(asyncio.create_task(worker) for worker in workers)]
+    pending = set(tasks)
+    try:
+        while not feed.done():
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        feed.result()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class AccountInstanceLock:
@@ -201,66 +351,18 @@ async def async_main() -> None:
         os.getenv("ENTRY_MODE", "alternating"),
     )
     trading_config = TradingConfig.from_env()
+    settings = configured_accounts()
     api = ProjectX(username, api_key)
-    account_lock: AccountInstanceLock | None = None
-
+    account_locks: list[AccountInstanceLock] = []
     try:
         await api.login()
-        account = select_explicit_account(
-            await api.accounts(), os.getenv("TOPSTEP_ACCOUNT_ID")
-        )
-        try:
-            verified_account = await api.verify_simulated_account(
-                int(account["id"]), str(account["name"])
-            )
-            account = {
-                **account,
-                **verified_account,
-                "_simulatedVerified": True,
-            }
-            logging.info(
-                "Account simulated status independently verified through user hub"
-            )
-        except ProjectXError as exc:
-            explicit_confirmed = (
-                os.getenv("PRACTICE_ACCOUNT_SIMULATED_VERIFIED", "")
-                .strip()
-                .lower()
-                == "true"
-            )
-            explicit_valid = ExecutionManager.explicit_verification_valid(
-                account,
-                os.getenv("VERIFIED_PRACTICE_ACCOUNT_ID"),
-                os.getenv("VERIFIED_PRACTICE_ACCOUNT_NAME"),
-                explicit_confirmed,
-            )
-            if explicit_valid:
-                account = {
-                    **account,
-                    "simulated": True,
-                    "_simulatedVerified": True,
-                    "_simulationVerificationSource": "explicit_config",
-                }
-                logging.warning(
-                    "Using explicit practice-account verification because "
-                    "ProjectX user hub did not provide a snapshot: %s",
-                    exc,
-                )
-            else:
-                account = {**account, "_simulatedVerified": False}
-                logging.error(
-                    "Account simulation verification failed closed: %s. "
-                    "Explicit verification is absent or mismatched.",
-                    exc,
-                )
-        account_lock = AccountInstanceLock(int(account["id"] ))
-        logging.info(
-            "Selected account id=%s name=%s canTrade=%s visible=%s",
-            account.get("id"),
-            account.get("name"),
-            account.get("canTrade"),
-            account.get("isVisible"),
-        )
+        available_accounts = await api.accounts()
+        selected_accounts = []
+        for account_settings in settings:
+            account = await verify_configured_account(api, available_accounts, account_settings)
+            account_locks.append(AccountInstanceLock(int(account["id"])))
+            selected_accounts.append(account)
+            logging.info("Selected account id=%s name=%s", account["id"], account["name"])
 
         contract = await api.mnq(live)
         point_value = float(contract["tickValue"]) / float(contract["tickSize"])
@@ -282,21 +384,30 @@ async def async_main() -> None:
             len(historical),
         )
 
-        execution = ExecutionManager(
-            api,
-            account,
-            contract,
-            trading_config,
-            quote_source=feed,
-        )
-        telegram = TelegramMonitor.from_env(
-            execution,
-            feed,
-            Path(__file__).resolve().parent / "data" / "telegram_trades.json",
-        )
-        if telegram is not None:
-            execution.event_sink = telegram
-        await execution.startup_check()
+        executions = [
+            ExecutionManager(
+                api, account, contract, account_trading_config(trading_config, account_settings),
+                quote_source=feed,
+                approved_account=(account_settings["account_id"], account_settings["account_name"],
+                                  account_settings["account_type"]),
+                entries_enabled=account_settings["enabled"],
+            )
+            for account, account_settings in zip(selected_accounts, settings)
+        ]
+        pause_store = PauseStateStore(Path(__file__).resolve().parent / "runtime" / "account_controls.db")
+        telegrams = []
+        for execution in executions:
+            execution.runtime_paused = pause_store.is_paused(execution.account["id"])
+            execution.entries_enabled = execution.configured_entries_enabled and not execution.runtime_paused
+            ledger = Path(__file__).resolve().parent / "data" / f"telegram_trades_{execution.account['id']}.json"
+            telegram = AccountTelegramMonitor.from_env(execution, feed, ledger)
+            if telegram is not None:
+                execution.event_sink = telegram
+                telegrams.append(telegram)
+        for telegram in telegrams:
+            telegram.peers = telegrams
+            telegram.pause_store = pause_store
+        await asyncio.gather(*(execution.startup_check() for execution in executions))
 
         async def on_closed_candle(candle, entry_eligible: bool) -> None:
             if isinstance(strategy, TestLongStrategy):
@@ -304,8 +415,9 @@ async def async_main() -> None:
                     candle,
                     emit_signal=entry_eligible,
                     entry_available=(
-                        not execution.order_pending
-                        and not execution.last_positions
+                        any(not execution.order_pending and not execution.last_positions
+                            and not execution.halted_reason and execution.entries_enabled
+                            for execution in executions)
                     ),
                 )
             else:
@@ -315,12 +427,12 @@ async def async_main() -> None:
                 )
             if result is None:
                 return
-            status = await execution.signal(
-                result,
+            statuses = await dispatch_signal(
+                executions, result,
                 entry_eligible=entry_eligible,
                 market_fresh=feed.market_is_fresh(),
             )
-            log_result(result, status)
+            log_result(result, str(statuses))
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -329,15 +441,13 @@ async def async_main() -> None:
             except NotImplementedError:
                 pass
 
-        tasks = [
-            feed.run(on_closed_candle),
-            execution.monitor(),
+        workers = [
+            *(execution.monitor() for execution in executions),
+            *(telegram.run() for telegram in telegrams),
         ]
-        if telegram is not None:
-            tasks.append(telegram.run())
-        await asyncio.gather(*tasks)
+        await run_bot_tasks(feed.run(on_closed_candle), workers)
     finally:
-        if account_lock is not None:
+        for account_lock in reversed(account_locks):
             account_lock.close()
         await api.close()
 

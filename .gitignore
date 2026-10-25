@@ -1,4 +1,5 @@
 .env
+accounts.json
 .venv/
 venv/
 __pycache__/
@@ -8,5 +9,6 @@ __pycache__/
 .ruff_cache/
 *.log
 data/telegram_trades.json
+data/telegram_trades_*.json
 runtime/
 data/telegram_subscribers.db*
