@@ -155,7 +155,12 @@ def load_account_configuration(path: Path) -> list[dict]:
                 limit = Decimal(str(account["max_daily_loss_usd"]))
                 if not limit.is_finite() or limit <= 0:
                     raise ValueError("max_daily_loss_usd must be a positive finite number")
-            for field in ("trail_activation_points", "trail_distance_points"):
+            for field in (
+                "stop_loss_points",
+                "take_profit_points",
+                "trail_activation_points",
+                "trail_distance_points",
+            ):
                 if field not in account:
                     continue
                 if isinstance(account[field], bool):
@@ -196,6 +201,12 @@ def account_trading_config(base: TradingConfig, settings: dict) -> TradingConfig
     changes = {key: settings[key] for key in ("contracts", "daily_loss_limit_enabled") if key in settings}
     if "max_daily_loss_usd" in settings:
         changes["max_daily_loss_usd"] = Decimal(str(settings["max_daily_loss_usd"]))
+    if "stop_loss_points" in settings:
+        changes["stop_loss_points"] = Decimal(str(settings["stop_loss_points"]))
+    if "take_profit_points" in settings:
+        changes["take_profit_points"] = Decimal(
+            str(settings["take_profit_points"])
+        )
     if "trail_activation_points" in settings:
         changes["trail_activation_points"] = Decimal(
             str(settings["trail_activation_points"])

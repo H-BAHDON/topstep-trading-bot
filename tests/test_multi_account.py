@@ -73,6 +73,10 @@ class AccountConfigurationTests(unittest.TestCase):
             {'contracts': 1.5}, {'daily_loss_limit_enabled': 'false'},
             {'max_daily_loss_usd': 'NaN'}, {'max_daily_loss_usd': -1},
             {'max_daily_loss_usd': 'Infinity'}, {'max_daily_loss_usd': True},
+            {'stop_loss_points': 'NaN'}, {'stop_loss_points': 0},
+            {'stop_loss_points': '1.1'}, {'stop_loss_points': True},
+            {'take_profit_points': 'NaN'}, {'take_profit_points': 0},
+            {'take_profit_points': '1.1'}, {'take_profit_points': True},
             {'trail_activation_points': 'NaN'}, {'trail_activation_points': 0},
             {'trail_activation_points': '1.1'}, {'trail_activation_points': True},
             {'trail_distance_points': 'Infinity'}, {'trail_distance_points': -1},
@@ -106,6 +110,8 @@ class AccountConfigurationTests(unittest.TestCase):
         first = account_trading_config(base, settings(
             contracts=2,
             max_daily_loss_usd='50.25',
+            stop_loss_points='40',
+            take_profit_points='25',
             trail_activation_points='10',
             trail_distance_points='1.75',
         ))
@@ -114,11 +120,14 @@ class AccountConfigurationTests(unittest.TestCase):
         self.assertEqual(first.max_daily_loss_usd, Decimal('50.25'))
         self.assertFalse(second.daily_loss_limit_enabled)
         self.assertTrue(first.daily_loss_limit_enabled)
-        self.assertEqual(first.stop_loss_points, base.stop_loss_points)
+        self.assertEqual(first.stop_loss_points, Decimal('40'))
+        self.assertEqual(first.take_profit_points, Decimal('25'))
         self.assertEqual(first.trail_activation_points, Decimal('10'))
         self.assertEqual(first.trail_distance_ticks, 7)
         self.assertEqual(second.trail_activation_points, base.trail_activation_points)
         self.assertEqual(second.trail_distance_ticks, base.trail_distance_ticks)
+        self.assertEqual(second.take_profit_points, base.take_profit_points)
+        self.assertEqual(second.stop_loss_points, base.stop_loss_points)
 
 
 class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):

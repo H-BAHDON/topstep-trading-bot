@@ -22,6 +22,8 @@ Example Express entry (replace both placeholders with the broker identity):
       "account_type": "express",
       "enabled": true,
       "contracts": 1,
+      "stop_loss_points": "40",
+      "take_profit_points": "25",
       "trail_activation_points": "10",
       "trail_distance_points": "1.75",
       "daily_loss_limit_enabled": true,
