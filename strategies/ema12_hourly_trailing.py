@@ -52,8 +52,6 @@ class Ema12HourlyTrailingStrategy:
             raise ValueError("EMA length must be positive")
         if timeframe_minutes <= 0 or 60 % timeframe_minutes:
             raise ValueError("timeframe must be a positive divisor of 60 minutes")
-        if start_time > end_time:
-            raise ValueError("start time must not be later than end time")
         if start_time.minute or end_time.minute:
             raise ValueError("start and end times must be whole hours")
         self.ema_length = ema_length
@@ -67,6 +65,12 @@ class Ema12HourlyTrailingStrategy:
         self.last_signal_candle_time: datetime | None = None
         self._bucket_start: datetime | None = None
         self._bucket: list[Candle] = []
+
+    def within_trading_hours(self, timestamp: datetime) -> bool:
+        clock = timestamp.astimezone(self.timezone).time()
+        if self.start_time > self.end_time:
+            return clock >= self.start_time or clock < self.end_time
+        return self.start_time <= clock < self.end_time
 
     @staticmethod
     def parse_clock(value: str) -> time:
@@ -115,7 +119,7 @@ class Ema12HourlyTrailingStrategy:
         close_time = (candle.time + timedelta(minutes=self.timeframe_minutes)).astimezone(
             self.timezone
         )
-        within_hours = self.start_time.hour <= close_time.hour <= self.end_time.hour
+        within_hours = self.within_trading_hours(close_time)
         scheduled = close_time.minute == 45 and within_hours
         signal = None
         if emit_signal and scheduled and candle.time != self.last_signal_candle_time:

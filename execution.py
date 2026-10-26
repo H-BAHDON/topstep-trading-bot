@@ -27,6 +27,8 @@ ENTRY_SIGNALS = {
     "SHORT_HOURLY": 1,
     "LONG_HOURLY_43": 0,
     "SHORT_HOURLY_43": 1,
+    "LONG_HOURLY_55": 0,
+    "SHORT_HOURLY_55": 1,
 }
 OPEN_OR_PENDING_STATUSES = {1, 6}
 FILLED_STATUS = 2
@@ -176,6 +178,7 @@ class TradingConfig:
         elif strategy_name in {
             "ema12_hourly_trailing",
             "ema12_hourly_trailing_43",
+            "ema12_hourly_trailing_55",
         }:
             def strategy_integer(name: str, default: str) -> int:
                 try:
@@ -285,6 +288,7 @@ class ExecutionManager:
         self.processed_candles: set[datetime] = set()
         self.last_positions: list[dict[str, Any]] = []
         self.realized_net = Decimal(0)
+        self.last_background_pnl_refresh: float | None = None
         self.confirmed_stop_price: Decimal | None = None
         self.confirmed_stop_order_id: int | None = None
         self.confirmed_take_profit_order_id: int | None = None
@@ -1912,12 +1916,15 @@ class ExecutionManager:
             return "ENTRY_VERIFICATION_PENDING"
         previous_had_position = bool(self.last_positions)
         positions, orders = await self.reconcile()
-        net = await self.daily_net_pnl()
-        if (
-            self.config.daily_loss_limit_enabled
-            and net <= -self.config.max_daily_loss_usd
+        now = asyncio.get_running_loop().time()
+        if self.config.daily_loss_limit_enabled and (
+            self.last_background_pnl_refresh is None
+            or now - self.last_background_pnl_refresh >= 15
         ):
-            self.halt(f"daily net P&L limit reached ({net:.2f} USD)")
+            net = await self.daily_net_pnl()
+            self.last_background_pnl_refresh = now
+            if net <= -self.config.max_daily_loss_usd:
+                self.halt(f"daily net P&L limit reached ({net:.2f} USD)")
         if previous_had_position and not positions:
             account_id = int(self.account["id"])
             confirmation_positions = await self.api.open_positions(account_id)

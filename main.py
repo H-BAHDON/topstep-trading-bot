@@ -21,6 +21,7 @@ from strategies.base import StrategyResult
 from strategies.test_long import TestLongStrategy
 from strategies.ema12_hourly_trailing import Ema12HourlyTrailingStrategy, HourlyEmaResult
 from strategies.ema12_hourly_trailing_43 import Ema12HourlyTrailing43Strategy
+from strategies.ema12_hourly_trailing_55 import Ema12HourlyTrailing55Strategy
 from telegram_monitor import AccountTelegramMonitor, PauseStateStore
 from topstep_api import MarketDataFeed, ProjectX, ProjectXError, env_bool
 
@@ -52,6 +53,7 @@ STRATEGIES = {
     "test_long": TestLongStrategy,
     "ema12_hourly_trailing": Ema12HourlyTrailingStrategy,
     "ema12_hourly_trailing_43": Ema12HourlyTrailing43Strategy,
+    "ema12_hourly_trailing_55": Ema12HourlyTrailing55Strategy,
 }
 
 
@@ -65,6 +67,7 @@ def select_strategy(name: str, entry_mode: str | None = None):
     if strategy_class in {
         Ema12HourlyTrailingStrategy,
         Ema12HourlyTrailing43Strategy,
+        Ema12HourlyTrailing55Strategy,
     }:
         try:
             ema_length = int(os.getenv("EMA12_HOURLY_EMA_LENGTH", "12"))
@@ -352,6 +355,11 @@ async def async_main() -> None:
     )
     trading_config = TradingConfig.from_env()
     settings = configured_accounts()
+    # Two state reads per account per cycle; leave capacity for entries, exit
+    # reconciliation, history and Telegram even when every account is flat.
+    trading_config = replace(trading_config, execution_poll_interval_seconds=max(
+        trading_config.execution_poll_interval_seconds, len(settings) * 1.5,
+    ))
     api = ProjectX(username, api_key)
     account_locks: list[AccountInstanceLock] = []
     try:

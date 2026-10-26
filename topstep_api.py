@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import random
+import re
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -34,8 +35,22 @@ def now_utc() -> datetime:
     return datetime.now(UTC)
 
 
-def parse_timestamp(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+def parse_timestamp(value: str | int | float) -> datetime:
+    if isinstance(value, bool):
+        raise ValueError("invalid timestamp")
+    if isinstance(value, (int, float)):
+        # Gateway payloads may use Unix seconds or milliseconds.
+        seconds = value / 1000 if abs(value) >= 100_000_000_000 else value
+        return datetime.fromtimestamp(seconds, UTC)
+    if not isinstance(value, str):
+        raise ValueError("invalid timestamp")
+    # .NET timestamps can carry seven fractional digits; Python 3.9 expects
+    # milliseconds or microseconds. Preserve microsecond precision explicitly.
+    normalized = re.sub(r"\.(\d+)", lambda match: "." + match[1][:6].ljust(6, "0"), value)
+    parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp must include a timezone")
+    return parsed.astimezone(UTC)
 
 
 def minute_start(value: datetime) -> datetime:
@@ -74,15 +89,60 @@ class Candle:
         )
 
 
+class RequestBudget:
+    """One rolling request budget and provider cooldown shared by all accounts."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.requests: deque[float] = deque()
+        self.next_read = 0.0
+        self.blocked_until = 0.0
+
+    async def acquire(self, *, mutation: bool = False) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            async with self.lock:
+                now = loop.time()
+                while self.requests and self.requests[0] <= now - 60:
+                    self.requests.popleft()
+                capacity = 190 if mutation else 160
+                ready = self.blocked_until
+                if not mutation:
+                    ready = max(ready, self.next_read)
+                if len(self.requests) >= capacity:
+                    ready = max(ready, self.requests[0] + 60)
+                delay = ready - now
+                if delay <= 0:
+                    self.requests.append(now)
+                    if not mutation:
+                        self.next_read = now + 0.4
+                    return
+            await asyncio.sleep(delay)
+
+    def cooldown(self, seconds: float) -> None:
+        self.blocked_until = max(self.blocked_until, asyncio.get_running_loop().time() + seconds)
+
+
 class ProjectX:
     def __init__(self, username: str, api_key: str) -> None:
         self.username = username
         self.api_key = api_key
         self.token: str | None = None
+        self.request_budget = RequestBudget()
         self.http = httpx.AsyncClient(base_url=API_URL, timeout=20)
 
     async def close(self) -> None:
         await self.http.aclose()
+
+    def observe_rate_limit(self, response: httpx.Response) -> None:
+        if response.status_code == 429:
+            try:
+                delay = float(response.headers.get("Retry-After", "30"))
+                if not math.isfinite(delay) or delay < 1:
+                    delay = 30.0
+            except ValueError:
+                delay = 30.0
+            self.request_budget.cooldown(delay)
 
     async def request(
         self, path: str, body: dict[str, Any], *, authenticated: bool = True
@@ -94,15 +154,20 @@ class ProjectX:
             if authenticated:
                 headers["Authorization"] = f"Bearer {self.token}"
             try:
+                await self.request_budget.acquire()
                 response = await self.http.post(path, json=body, headers=headers)
                 if response.status_code == 401 and authenticated and attempt == 0:
                     await self.login()
                     continue
                 if response.status_code == 429:
-                    delay = float(
-                        response.headers.get("Retry-After", min(2**attempt, 30))
-                    )
-                    logging.warning("Rate limited; retrying in %.1fs", delay)
+                    try:
+                        delay = float(response.headers.get("Retry-After", min(2**attempt, 30)))
+                        if not math.isfinite(delay) or delay < 1:
+                            delay = 30.0
+                    except ValueError:
+                        delay = 30.0
+                    self.request_budget.cooldown(delay)
+                    logging.warning("Rate limited endpoint=%s; shared cooldown %.1fs", path, delay)
                     await asyncio.sleep(delay + random.random() / 2)
                     continue
                 response.raise_for_status()
@@ -323,9 +388,11 @@ class ProjectX:
             "Authorization": f"Bearer {self.token}",
         }
         try:
+            await self.request_budget.acquire(mutation=True)
             response = await self.http.post(
                 "/api/Order/place", json=payload, headers=headers
             )
+            self.observe_rate_limit(response)
             response.raise_for_status()
             return response.json()
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -345,9 +412,11 @@ class ProjectX:
             "Authorization": f"Bearer {self.token}",
         }
         try:
+            await self.request_budget.acquire(mutation=True)
             response = await self.http.post(
                 "/api/Position/closeContract", json=payload, headers=headers
             )
+            self.observe_rate_limit(response)
             response.raise_for_status()
             return response.json()
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -366,9 +435,11 @@ class ProjectX:
             "Authorization": f"Bearer {self.token}",
         }
         try:
+            await self.request_budget.acquire(mutation=True)
             response = await self.http.post(
                 "/api/Order/cancel", json=payload, headers=headers
             )
+            self.observe_rate_limit(response)
             response.raise_for_status()
             return response.json()
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
@@ -471,7 +542,8 @@ class MarketDataFeed:
         if count > 5 and count % 100:
             return
         if isinstance(payload, dict):
-            shape = f"dict keys={sorted(map(str, payload.keys()))}"
+            fields = {str(key): type(value).__name__ for key, value in payload.items()}
+            shape = f"dict fieldTypes={fields}"
         elif isinstance(payload, list):
             item_types = sorted({type(item).__name__ for item in payload})
             shape = f"list length={len(payload)} itemTypes={item_types}"
@@ -505,19 +577,24 @@ class MarketDataFeed:
         try:
             raw_price = trade.get("price")
             raw_time = trade.get("timestamp")
-            raw_volume = trade.get("volume", 0)
+            if raw_time is None:
+                raw_time = trade.get("epoch")
+            raw_volume = trade.get("volume")
+            if raw_volume is None:
+                raw_volume = 0
             if (
                 raw_price is None
                 or isinstance(raw_price, bool)
                 or isinstance(raw_volume, bool)
-                or not isinstance(raw_time, str)
+                or isinstance(raw_time, bool)
+                or not isinstance(raw_time, (str, int, float))
             ):
                 raise ValueError("missing or invalid trade fields")
             price, size = float(raw_price), float(raw_volume)
             if not math.isfinite(price) or not math.isfinite(size) or size < 0:
                 raise ValueError("invalid price or volume")
             trade_time = parse_timestamp(raw_time)
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError, OSError):
             self.log_unexpected_payload("GatewayTrade fields", trade)
             return
 

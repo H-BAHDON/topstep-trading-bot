@@ -18,9 +18,12 @@ from topstep_api import Candle
 
 class Ema12HourlyTrailing43Strategy(Ema12HourlyTrailingStrategy):
     name = "ema12_hourly_trailing_43"
+    partial_minutes = 13
+    signal_bucket_minute = 30
+    signal_minute = 43
 
     def _partial_candle(self) -> Candle | None:
-        expected_size = 13  # completed minutes :30 through :42
+        expected_size = self.partial_minutes
         if self._bucket_start is None or len(self._bucket) != expected_size:
             return None
         expected = [
@@ -47,16 +50,16 @@ class Ema12HourlyTrailing43Strategy(Ema12HourlyTrailingStrategy):
             if self.ema is None
             else alpha * candle.close + (1.0 - alpha) * self.ema
         )
-        signal_time = (candle.time + timedelta(minutes=13)).astimezone(
+        signal_time = (candle.time + timedelta(minutes=self.partial_minutes)).astimezone(
             self.timezone
         )
-        within_hours = self.start_time.hour <= signal_time.hour <= self.end_time.hour
+        within_hours = self.within_trading_hours(signal_time)
         signal = None
         if emit_signal and within_hours and candle.time != self.last_signal_candle_time:
             if candle.close > projected_ema:
-                signal = "LONG_HOURLY_43"
+                signal = f"LONG_HOURLY_{self.signal_minute}"
             elif candle.close < projected_ema:
-                signal = "SHORT_HOURLY_43"
+                signal = f"SHORT_HOURLY_{self.signal_minute}"
             self.last_signal_candle_time = candle.time
         trend = (
             "ABOVE" if candle.close > projected_ema
@@ -81,8 +84,8 @@ class Ema12HourlyTrailing43Strategy(Ema12HourlyTrailingStrategy):
         self._bucket.append(candle)
 
         if (
-            bucket_start.minute == 30
-            and timestamp == bucket_start + timedelta(minutes=12)
+            bucket_start.minute == self.signal_bucket_minute
+            and timestamp == bucket_start + timedelta(minutes=self.partial_minutes - 1)
         ):
             partial = self._partial_candle()
             return (

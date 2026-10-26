@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from strategies.ema12_hourly_trailing_43 import Ema12HourlyTrailing43Strategy
 from topstep_api import Candle
@@ -10,6 +10,33 @@ UTC = timezone.utc
 
 
 class Ema12HourlyTrailing43Tests(unittest.TestCase):
+    def test_overnight_window_accepts_signals_and_excludes_break(self):
+        for hour, expected in ((23, True), (0, True), (12, True), (21, True), (22, False)):
+            strategy = Ema12HourlyTrailing43Strategy(start_time=time(23), end_time=time(22))
+            strategy.ema = 100
+            candle = Candle(datetime(2026, 1, 1, hour, 30, tzinfo=UTC), 110, 110, 110, 110, 1)
+            with self.subTest(hour=hour):
+                result = strategy._evaluate_partial(candle, emit_signal=True)
+                self.assertEqual(result.signal is not None, expected)
+
+    def test_exact_overnight_boundaries_and_london_summer_time(self):
+        strategy = Ema12HourlyTrailing43Strategy(start_time=time(23), end_time=time(22))
+        for stamp, expected in (
+            ('2026-01-01T22:59:59+00:00', False),
+            ('2026-01-01T23:00:00+00:00', True),
+            ('2026-01-02T21:59:59+00:00', True),
+            ('2026-01-02T22:00:00+00:00', False),
+            ('2026-07-01T22:00:00+00:00', True),
+            ('2026-07-01T21:00:00+00:00', False),
+        ):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(strategy.within_trading_hours(datetime.fromisoformat(stamp)), expected)
+
+    def test_daytime_window_uses_exact_end_time(self):
+        strategy = Ema12HourlyTrailing43Strategy(start_time=time(9), end_time=time(20))
+        self.assertTrue(strategy.within_trading_hours(datetime(2026, 1, 1, 19, 43, tzinfo=UTC)))
+        self.assertFalse(strategy.within_trading_hours(datetime(2026, 1, 1, 20, 43, tzinfo=UTC)))
+
     def test_emits_from_completed_minutes_through_42_only(self) -> None:
         strategy = Ema12HourlyTrailing43Strategy(ema_length=2)
         warm_start = datetime(2026, 1, 1, 0, 15, tzinfo=UTC)
