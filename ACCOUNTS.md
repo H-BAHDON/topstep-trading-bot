@@ -80,6 +80,20 @@ explicit target for setting changes. Control commands never implicitly target
 all accounts. `/stop` still means unsubscribe from notifications; it does not
 pause trading.
 
+All accounts share a REST request budget, with read pacing, reserved capacity
+for order mutations, and a common cooldown after HTTP 429 responses. Uncertain
+order submissions are still not retried. Other clients using the same broker
+credentials can also consume provider capacity.
+
+The effective background poll interval is the larger of
+`EXECUTION_POLL_INTERVAL_SECONDS` and `1.5 * number_of_configured_accounts`
+seconds (4.5 seconds with three accounts). This reduces request volume at the
+cost of slower detection of trailing activation and position closures. The
+broker's accepted protective orders remain independent of polling. Disabled
+daily loss limits do not trigger background trade-history requests; enabled
+limits refresh that history at most every 15 seconds. Pre-entry loss checks
+still request fresh trade history.
+
 Read reports (`/status`, `/profit`, `/trades`, `/stats`) keep their existing
 public private-chat access and can specify an account or `all`. Without a
 target, they report every account. `/profit all` also reports combined open,
