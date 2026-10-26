@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -203,7 +202,7 @@ class AccountControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Data unavailable', self.primary.send_to.call_args.args[1])
 
     async def test_invalid_saved_pause_state_is_rejected(self):
-        with sqlite3.connect(str(self.store.path)) as connection:
+        with self.store.database() as connection:
             connection.execute('INSERT INTO pauses VALUES (2, 5)')
         with self.assertRaises(ValueError):
             self.store.is_paused(2)

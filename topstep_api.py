@@ -98,27 +98,52 @@ class RequestBudget:
         self.requests: deque[float] = deque()
         self.next_read = 0.0
         self.blocked_until = 0.0
+        self.priority_waiters = 0
+        self.priority_cleared = asyncio.Event()
+        self.priority_cleared.set()
 
-    async def acquire(self, *, mutation: bool = False) -> None:
+    async def acquire(
+        self, *, mutation: bool = False, priority: bool = False
+    ) -> None:
         loop = asyncio.get_running_loop()
-        while True:
+        if priority:
             async with self.lock:
-                now = loop.time()
-                while self.requests and self.requests[0] <= now - 60:
-                    self.requests.popleft()
-                capacity = 190 if mutation else 160
-                ready = self.blocked_until
-                if not mutation:
-                    ready = max(ready, self.next_read)
-                if len(self.requests) >= capacity:
-                    ready = max(ready, self.requests[0] + 60)
-                delay = ready - now
-                if delay <= 0:
-                    self.requests.append(now)
-                    if not mutation:
-                        self.next_read = now + 0.4
-                    return
-            await asyncio.sleep(delay)
+                self.priority_waiters += 1
+                self.priority_cleared.clear()
+        try:
+            while True:
+                if not priority and self.priority_waiters:
+                    await self.priority_cleared.wait()
+                    continue
+                async with self.lock:
+                    if not priority and self.priority_waiters:
+                        continue
+                    now = loop.time()
+                    while self.requests and self.requests[0] <= now - 60:
+                        self.requests.popleft()
+                    capacity = 190 if mutation else 160
+                    ready = self.blocked_until
+                    # Latency-critical entry reads may use the available rolling
+                    # budget as a burst. Background reads remain deliberately
+                    # spaced, and every request still observes the shared
+                    # provider cooldown and rolling capacity.
+                    if not mutation and not priority:
+                        ready = max(ready, self.next_read)
+                    if len(self.requests) >= capacity:
+                        ready = max(ready, self.requests[0] + 60)
+                    delay = ready - now
+                    if delay <= 0:
+                        self.requests.append(now)
+                        if not mutation:
+                            self.next_read = now + 0.4
+                        return
+                await asyncio.sleep(delay)
+        finally:
+            if priority:
+                async with self.lock:
+                    self.priority_waiters -= 1
+                    if not self.priority_waiters:
+                        self.priority_cleared.set()
 
     def cooldown(self, seconds: float) -> None:
         self.blocked_until = max(self.blocked_until, asyncio.get_running_loop().time() + seconds)
@@ -146,7 +171,8 @@ class ProjectX:
             self.request_budget.cooldown(delay)
 
     async def request(
-        self, path: str, body: dict[str, Any], *, authenticated: bool = True
+        self, path: str, body: dict[str, Any], *, authenticated: bool = True,
+        priority: bool = False,
     ) -> dict[str, Any]:
         if authenticated and not self.token:
             await self.login()
@@ -155,8 +181,35 @@ class ProjectX:
             if authenticated:
                 headers["Authorization"] = f"Bearer {self.token}"
             try:
-                await self.request_budget.acquire()
-                response = await self.http.post(path, json=body, headers=headers)
+                loop = asyncio.get_running_loop()
+                queued_at = loop.time()
+                log = logging.info if priority else logging.debug
+                log(
+                    "API QUEUE START endpoint=%s accountId=%s priority=%s attempt=%d monotonic=%.6f",
+                    path, body.get("accountId"), priority, attempt + 1, queued_at,
+                )
+                await self.request_budget.acquire(priority=priority)
+                admitted_at = loop.time()
+                log(
+                    "API QUEUE COMPLETE endpoint=%s accountId=%s priority=%s queueMs=%.3f monotonic=%.6f",
+                    path, body.get("accountId"), priority,
+                    (admitted_at - queued_at) * 1000, admitted_at,
+                )
+                log(
+                    "HTTP REQUEST START endpoint=%s accountId=%s priority=%s monotonic=%.6f",
+                    path, body.get("accountId"), priority, admitted_at,
+                )
+                try:
+                    response = await self.http.post(path, json=body, headers=headers)
+                finally:
+                    completed_at = loop.time()
+                    log(
+                        "HTTP REQUEST COMPLETE endpoint=%s accountId=%s priority=%s httpMs=%.3f totalMs=%.3f monotonic=%.6f",
+                        path, body.get("accountId"), priority,
+                        (completed_at - admitted_at) * 1000,
+                        (completed_at - queued_at) * 1000,
+                        completed_at,
+                    )
                 if response.status_code == 401 and authenticated and attempt == 0:
                     await self.login()
                     continue
@@ -343,38 +396,44 @@ class ProjectX:
         unique = {bar.time: bar for bar in map(Candle.from_api, data["bars"])}
         return sorted(unique.values(), key=lambda candle: candle.time)[-limit:]
 
-    async def open_positions(self, account_id: int) -> list[dict[str, Any]]:
+    async def open_positions(
+        self, account_id: int, *, priority: bool = False
+    ) -> list[dict[str, Any]]:
         data = await self.request(
-            "/api/Position/searchOpen", {"accountId": account_id}
+            "/api/Position/searchOpen", {"accountId": account_id}, priority=priority
         )
         return data["positions"]
 
-    async def open_orders(self, account_id: int) -> list[dict[str, Any]]:
+    async def open_orders(
+        self, account_id: int, *, priority: bool = False
+    ) -> list[dict[str, Any]]:
         data = await self.request(
-            "/api/Order/searchOpen", {"accountId": account_id}
+            "/api/Order/searchOpen", {"accountId": account_id}, priority=priority
         )
         return data["orders"]
 
     async def orders(
-        self, account_id: int, start: datetime, end: datetime | None = None
+        self, account_id: int, start: datetime, end: datetime | None = None,
+        *, priority: bool = False,
     ) -> list[dict[str, Any]]:
         body: dict[str, Any] = {
             "accountId": account_id,
             "startTimestamp": start.astimezone(UTC).isoformat(),
             "endTimestamp": (end or now_utc()).astimezone(UTC).isoformat(),
         }
-        data = await self.request("/api/Order/search", body)
+        data = await self.request("/api/Order/search", body, priority=priority)
         return data["orders"]
 
     async def trades(
-        self, account_id: int, start: datetime, end: datetime | None = None
+        self, account_id: int, start: datetime, end: datetime | None = None,
+        *, priority: bool = False,
     ) -> list[dict[str, Any]]:
         body: dict[str, Any] = {
             "accountId": account_id,
             "startTimestamp": start.astimezone(UTC).isoformat(),
             "endTimestamp": (end or now_utc()).astimezone(UTC).isoformat(),
         }
-        data = await self.request("/api/Trade/search", body)
+        data = await self.request("/api/Trade/search", body, priority=priority)
         return data["trades"]
 
     async def place_order_once(
@@ -388,11 +447,35 @@ class ProjectX:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.token}",
         }
+        loop = asyncio.get_running_loop()
+        queued_at = loop.time()
+        account_id = payload.get("accountId")
+        logging.info(
+            "API MUTATION QUEUE START endpoint=/api/Order/place accountId=%s monotonic=%.6f",
+            account_id, queued_at,
+        )
         try:
             await self.request_budget.acquire(mutation=True)
-            response = await self.http.post(
-                "/api/Order/place", json=payload, headers=headers
+            admitted_at = loop.time()
+            logging.info(
+                "API MUTATION QUEUE COMPLETE endpoint=/api/Order/place accountId=%s queueMs=%.3f monotonic=%.6f",
+                account_id, (admitted_at - queued_at) * 1000, admitted_at,
             )
+            logging.info(
+                "HTTP MUTATION START endpoint=/api/Order/place accountId=%s monotonic=%.6f",
+                account_id, admitted_at,
+            )
+            try:
+                response = await self.http.post(
+                    "/api/Order/place", json=payload, headers=headers
+                )
+            finally:
+                completed_at = loop.time()
+                logging.info(
+                    "HTTP MUTATION COMPLETE endpoint=/api/Order/place accountId=%s httpMs=%.3f totalMs=%.3f monotonic=%.6f",
+                    account_id, (completed_at - admitted_at) * 1000,
+                    (completed_at - queued_at) * 1000, completed_at,
+                )
             self.observe_rate_limit(response)
             response.raise_for_status()
             return response.json()

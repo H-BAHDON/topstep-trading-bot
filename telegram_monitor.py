@@ -747,18 +747,31 @@ class PauseStateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(str(path)) as connection:
+        with self.database() as connection:
             connection.execute('CREATE TABLE IF NOT EXISTS pauses (account_id INTEGER PRIMARY KEY, paused INTEGER NOT NULL)')
 
+    @contextmanager
+    def database(self):
+        """Commit or roll back and always release the Windows file handle."""
+        connection = sqlite3.connect(str(self.path), timeout=5)
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def is_paused(self, account_id: int) -> bool:
-        with sqlite3.connect(str(self.path)) as connection:
+        with self.database() as connection:
             row = connection.execute('SELECT paused FROM pauses WHERE account_id = ?', (account_id,)).fetchone()
         if row is not None and row[0] not in (0, 1):
             raise ValueError('Invalid saved account pause state')
         return bool(row and row[0])
 
     def set_paused(self, account_id: int, paused: bool) -> None:
-        with sqlite3.connect(str(self.path)) as connection:
+        with self.database() as connection:
             connection.execute(
                 'INSERT INTO pauses(account_id, paused) VALUES (?, ?) '
                 'ON CONFLICT(account_id) DO UPDATE SET paused=excluded.paused',

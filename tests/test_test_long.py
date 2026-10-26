@@ -4,7 +4,6 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from main import select_strategy
-from strategies.ema_cross import EmaCrossStrategy
 from strategies.test_long import TestLongStrategy
 from topstep_api import Candle
 
@@ -108,9 +107,8 @@ class TestLongStrategyTests(unittest.TestCase):
             ],
         )
 
-    def test_strategy_selection_switches_without_changing_ema(self) -> None:
+    def test_strategy_selection_supports_test_strategy(self) -> None:
         self.assertIsInstance(select_strategy("test_long"), TestLongStrategy)
-        self.assertIsInstance(select_strategy("ema_cross"), EmaCrossStrategy)
 
 
 if __name__ == "__main__":

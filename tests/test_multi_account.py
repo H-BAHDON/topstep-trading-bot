@@ -131,6 +131,364 @@ class AccountConfigurationTests(unittest.TestCase):
 
 
 class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_simulated_next_signal_entry_ack_and_trailing_timeline(self):
+        api = FakeApi()
+        first = manager(
+            28973448,
+            contracts=15,
+            strategy_name='ema12_hourly_trailing_43',
+            stop_loss_points=Decimal('40'),
+            take_profit_points=Decimal('10'),
+            trail_activation_points=Decimal('2'),
+            trail_distance_ticks=4,
+            daily_loss_limit_enabled=False,
+        )
+        second = manager(
+            29014575,
+            contracts=10,
+            strategy_name='ema12_hourly_trailing_43',
+            stop_loss_points=Decimal('40'),
+            take_profit_points=Decimal('10'),
+            trail_activation_points=Decimal('5'),
+            trail_distance_ticks=8,
+            daily_loss_limit_enabled=False,
+        )
+        first.api = second.api = api
+        requests = {}
+        acknowledgements = {}
+        trailing_requests = {}
+        trailing_activations = {}
+        trailing_events = {
+            first.account['id']: asyncio.Event(),
+            second.account['id']: asyncio.Event(),
+        }
+
+        async def delayed_read(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return []
+
+        async def delayed_place(payload):
+            account_id = payload['accountId']
+            api.place_calls.append(payload)
+            requests[account_id] = asyncio.get_running_loop().time()
+            await asyncio.sleep(0.05)
+            acknowledgements[account_id] = asyncio.get_running_loop().time()
+            return {
+                'success': True, 'errorCode': 0,
+                'errorMessage': None,
+                'orderId': 700 + len(acknowledgements),
+            }
+
+        def configure_fill_and_trailing(candidate, position_id, stop_id):
+            async def verify(*args, **kwargs):
+                await asyncio.sleep(0.02)
+                filled_position = {
+                    'id': position_id,
+                    'accountId': candidate.account['id'],
+                    'contractId': candidate.contract['id'],
+                    'type': 1,
+                    'size': candidate.config.contracts,
+                    'averagePrice': 30600.25,
+                }
+                candidate.last_positions = [filled_position]
+                candidate.confirmed_position_id = position_id
+                candidate.confirmed_position_type = 1
+                candidate.confirmed_position_size = candidate.config.contracts
+                candidate.confirmed_stop_order_id = stop_id
+                candidate.locally_opened_position_id = position_id
+                return 'FILLED_PROTECTED'
+
+            async def activate(*args, **kwargs):
+                account_id = candidate.account['id']
+                trailing_requests[account_id] = asyncio.get_running_loop().time()
+                await asyncio.sleep(0.03)
+                candidate.native_trailing_active = True
+                trailing_activations[account_id] = asyncio.get_running_loop().time()
+                trailing_events[account_id].set()
+                return 'NATIVE_TRAILING_ACTIVE'
+
+            candidate.verify_entry = AsyncMock(side_effect=verify)
+            candidate.activate_native_trailing = AsyncMock(side_effect=activate)
+
+        configure_fill_and_trailing(first, 101, 801)
+        configure_fill_and_trailing(second, 102, 802)
+
+        api.open_positions = delayed_read
+        api.open_orders = delayed_read
+        api.orders = delayed_read
+        api.place_order_once = delayed_place
+        started = asyncio.get_running_loop().time()
+        statuses = await dispatch_signal(
+            [first, second], signal_result('LONG_HOURLY_43'),
+            entry_eligible=True, market_fresh=True,
+        )
+        two_point_quote_received = asyncio.get_running_loop().time()
+        for candidate in (first, second):
+            candidate.observe_live_price({'lastPrice': 30602.25})
+        await asyncio.wait_for(trailing_events[first.account['id']].wait(), 1)
+        self.assertFalse(trailing_events[second.account['id']].is_set())
+
+        five_point_quote_received = asyncio.get_running_loop().time()
+        for candidate in (first, second):
+            candidate.observe_live_price({'lastPrice': 30605.25})
+        await asyncio.wait_for(
+            trailing_events[second.account['id']].wait(),
+            1,
+        )
+
+        account_ids = [first.account['id'], second.account['id']]
+        request_gap = abs(requests[account_ids[1]] - requests[account_ids[0]])
+        acknowledgement_gap = abs(
+            acknowledgements[account_ids[1]] - acknowledgements[account_ids[0]]
+        )
+        trailing_gap = abs(
+            trailing_activations[account_ids[1]]
+            - trailing_activations[account_ids[0]]
+        )
+        print(
+            'SIMULATED SIGNAL TIMELINE '
+            f'signalDetectedMs=0.000 '
+            f'twoPointQuoteMs={(two_point_quote_received - started) * 1000:.3f} '
+            f'fivePointQuoteMs={(five_point_quote_received - started) * 1000:.3f}'
+        )
+        for candidate in (first, second):
+            account_id = candidate.account['id']
+            print(
+                f'SIMULATED ACCOUNT TIMELINE accountId={account_id} '
+                f'entryRequestMs={(requests[account_id] - started) * 1000:.3f} '
+                f'ackMs={(acknowledgements[account_id] - started) * 1000:.3f} '
+                f'trailingRequestMs={(trailing_requests[account_id] - started) * 1000:.3f} '
+                f'trailingActiveMs={(trailing_activations[account_id] - started) * 1000:.3f}'
+            )
+        print(
+            'SIMULATED ACCOUNT GAPS '
+            f'entryRequestGapMs={request_gap * 1000:.3f} '
+            f'ackGapMs={acknowledgement_gap * 1000:.3f} '
+            f'trailingActivationGapMs={trailing_gap * 1000:.3f}'
+        )
+
+        self.assertEqual(set(statuses.values()), {'FILLED_PROTECTED'})
+        self.assertEqual(
+            {account_id: requests[account_id] for account_id in account_ids}.keys(),
+            requests.keys(),
+        )
+        self.assertEqual(
+            {payload['accountId']: payload['size'] for payload in api.place_calls},
+            {first.account['id']: 15, second.account['id']: 10},
+        )
+        self.assertTrue(
+            all(
+                payload['stopLossBracket']['type'] == 4
+                and payload['takeProfitBracket']['type'] == 1
+                for payload in api.place_calls
+            )
+        )
+        self.assertLess(min(requests.values()) - started, 0.25)
+        self.assertLess(request_gap, 0.04)
+        self.assertLess(acknowledgement_gap, 0.04)
+        self.assertLess(
+            trailing_requests[first.account['id']], five_point_quote_received
+        )
+        self.assertGreaterEqual(
+            trailing_requests[second.account['id']], five_point_quote_received
+        )
+        self.assertTrue(all(candidate.native_trailing_active for candidate in (first, second)))
+
+    async def test_pre_entry_reads_run_as_two_concurrent_dependency_batches(self):
+        api = FakeApi()
+        first, second = manager(daily_loss_limit_enabled=False), manager(
+            2, daily_loss_limit_enabled=False
+        )
+        first.api = second.api = api
+        calls = []
+        state_arrivals = asyncio.Event()
+        history_arrivals = asyncio.Event()
+
+        async def state_read(kind, account_id):
+            calls.append((kind, account_id, 'start'))
+            state_starts = [call for call in calls if call[2] == 'start' and call[0] != 'history']
+            if len(state_starts) == 4:
+                state_arrivals.set()
+            await asyncio.wait_for(state_arrivals.wait(), 1)
+            calls.append((kind, account_id, 'end'))
+            return []
+
+        async def history(account_id, *args, **kwargs):
+            self.assertEqual(
+                len([call for call in calls if call[2] == 'end' and call[0] != 'history']),
+                4,
+            )
+            calls.append(('history', account_id, 'start'))
+            if len([call for call in calls if call[:1] == ('history',) and call[2] == 'start']) == 2:
+                history_arrivals.set()
+            await asyncio.wait_for(history_arrivals.wait(), 1)
+            calls.append(('history', account_id, 'end'))
+            return []
+
+        async def positions(account_id, **kwargs):
+            return await state_read('positions', account_id)
+
+        async def open_orders(account_id, **kwargs):
+            return await state_read('open_orders', account_id)
+
+        api.open_positions = AsyncMock(side_effect=positions)
+        api.open_orders = AsyncMock(side_effect=open_orders)
+        api.orders = AsyncMock(side_effect=history)
+
+        statuses = await asyncio.wait_for(
+            dispatch_signal(
+                [first, second], signal_result(),
+                entry_eligible=True, market_fresh=True,
+            ),
+            2,
+        )
+
+        self.assertEqual(set(statuses.values()), {'ORDER_REJECTED'})
+        self.assertEqual(api.open_positions.await_count, 2)
+        self.assertEqual(api.open_orders.await_count, 2)
+        self.assertEqual(api.orders.await_count, 2)
+
+    async def test_pending_entry_preparation_overtakes_new_monitor_lock_waiter(self):
+        candidate = manager(daily_loss_limit_enabled=False)
+        await candidate.lock.acquire()
+        order = []
+
+        monitor = asyncio.create_task(candidate.monitor_once())
+        await asyncio.sleep(0)
+
+        original_reconcile = candidate.reconcile
+
+        async def reconcile(*args, **kwargs):
+            if kwargs.get('priority'):
+                order.append('entry')
+            else:
+                order.append('monitor')
+            return await original_reconcile(*args, **kwargs)
+
+        candidate.reconcile = reconcile
+        entry = asyncio.create_task(candidate.prepare_entry(
+            signal_result(), entry_eligible=True, market_fresh=True,
+        ))
+        await asyncio.sleep(0)
+        candidate.lock.release()
+
+        prepared = await asyncio.wait_for(entry, 1)
+        self.assertEqual(order[0], 'entry')
+        candidate.abort_prepared_entry(prepared)
+        await asyncio.wait_for(monitor, 1)
+        self.assertEqual(order, ['entry', 'monitor'])
+
+    async def test_two_phase_dispatch_submits_prepared_accounts_concurrently(self):
+        api = FakeApi()
+        first, second = manager(daily_loss_limit_enabled=False), manager(
+            2, daily_loss_limit_enabled=False
+        )
+        first.api = second.api = api
+        submitted = []
+        both_arrived = asyncio.Event()
+
+        async def place(payload):
+            submitted.append((payload, asyncio.get_running_loop().time()))
+            if len(submitted) == 2:
+                both_arrived.set()
+            await asyncio.wait_for(both_arrived.wait(), 1)
+            return {
+                'success': False, 'errorCode': 2,
+                'errorMessage': 'mock rejection', 'orderId': len(submitted),
+            }
+
+        api.place_order_once = place
+        statuses = await asyncio.wait_for(
+            dispatch_signal(
+                [first, second], signal_result(),
+                entry_eligible=True, market_fresh=True,
+            ),
+            2,
+        )
+
+        self.assertEqual(set(statuses.values()), {'ORDER_REJECTED'})
+        self.assertEqual(len(submitted), 2)
+        self.assertLess(abs(submitted[1][1] - submitted[0][1]), 0.02)
+        self.assertEqual({item[0]['accountId'] for item in submitted}, {12345678, 2})
+        self.assertTrue(all(item[0]['stopLossBracket']['type'] == 4 for item in submitted))
+        self.assertTrue(all(not candidate.order_pending for candidate in (first, second)))
+        self.assertTrue(all(not candidate.lock.locked() for candidate in (first, second)))
+
+    async def test_two_phase_failure_isolated_and_never_rolled_back(self):
+        api = FakeApi()
+        first, second = manager(daily_loss_limit_enabled=False), manager(
+            2, daily_loss_limit_enabled=False
+        )
+        first.api = second.api = api
+        calls = []
+
+        async def place(payload):
+            calls.append(payload['accountId'])
+            if payload['accountId'] == first.account['id']:
+                raise ProjectXError('mock uncertain submission')
+            return {
+                'success': False, 'errorCode': 2,
+                'errorMessage': 'mock rejection', 'orderId': 22,
+            }
+
+        api.place_order_once = place
+        statuses = await dispatch_signal(
+            [first, second], signal_result(), entry_eligible=True, market_fresh=True
+        )
+
+        self.assertEqual(statuses[first.account['id']], 'ORDER_UNCERTAIN')
+        self.assertEqual(statuses[second.account['id']], 'ORDER_REJECTED')
+        self.assertEqual(set(calls), {first.account['id'], second.account['id']})
+        self.assertIsNotNone(first.halted_reason)
+        self.assertIsNone(second.halted_reason)
+        self.assertFalse(first.api.close_calls)
+
+    async def test_two_phase_duplicate_is_blocked_before_any_second_submission(self):
+        first, second = manager(daily_loss_limit_enabled=False), manager(
+            2, daily_loss_limit_enabled=False
+        )
+        result = signal_result()
+        await dispatch_signal(
+            [first, second], result, entry_eligible=True, market_fresh=True
+        )
+        statuses = await dispatch_signal(
+            [first, second], result, entry_eligible=True, market_fresh=True
+        )
+        self.assertEqual(set(statuses.values()), {'DUPLICATE_BLOCKED'})
+        self.assertEqual(len(first.api.place_calls), 1)
+        self.assertEqual(len(second.api.place_calls), 1)
+
+    async def test_disabled_loss_limit_skips_pre_entry_trade_history(self):
+        candidate = manager(daily_loss_limit_enabled=False)
+        candidate.api.trades = AsyncMock(return_value=[])
+        await dispatch_signal(
+            [candidate], signal_result(), entry_eligible=True, market_fresh=True
+        )
+        candidate.api.trades.assert_not_awaited()
+
+    async def test_two_phase_acceptance_keeps_oco_and_independent_verification(self):
+        first, second = manager(daily_loss_limit_enabled=False), manager(
+            2, daily_loss_limit_enabled=False
+        )
+        for order_id, candidate in enumerate((first, second), start=70):
+            candidate.api.place_response = {
+                'success': True, 'errorCode': 0,
+                'errorMessage': None, 'orderId': order_id,
+            }
+            candidate.verify_entry = AsyncMock(return_value='FILLED_PROTECTED')
+
+        statuses = await dispatch_signal(
+            [first, second], signal_result(), entry_eligible=True, market_fresh=True
+        )
+
+        self.assertEqual(set(statuses.values()), {'FILLED_PROTECTED'})
+        for order_id, candidate in enumerate((first, second), start=70):
+            payload = candidate.api.place_calls[0]
+            self.assertEqual(payload['stopLossBracket'], {'ticks': -40, 'type': 4})
+            candidate.verify_entry.assert_awaited_once_with(
+                order_id, candidate.custom_tag(signal_result()), set()
+            )
+
     async def test_disabled_account_blocks_entries_but_recovers_protected_positions(self):
         candidate = manager()
         candidate.entries_enabled = False
@@ -205,7 +563,7 @@ class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
         api.open_positions = AsyncMock(return_value=[])
         api.open_orders = AsyncMock(return_value=[])
         api.orders = AsyncMock(return_value=[])
-        async def trades(account_id, *args):
+        async def trades(account_id, *args, **kwargs):
             return [{'accountId': account_id, 'profitAndLoss': -100 if account_id == 12345678 else 25}]
         api.trades = AsyncMock(side_effect=trades)
         first, second = manager(), manager(2)
@@ -227,7 +585,7 @@ class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
         async def healthy(*args, **kwargs):
             arrived.set()
             return 'ORDER_REJECTED'
-        first.signal, second.signal = failing, healthy
+        first.prepare_entry, second.prepare_entry = failing, healthy
         statuses = await dispatch_signal([first, second], signal_result(), entry_eligible=True, market_fresh=True)
         self.assertEqual(statuses, {12345678: 'UNCERTAIN_BLOCKED', 2: 'ORDER_REJECTED'})
         self.assertTrue(first.halted_reason)
@@ -235,7 +593,7 @@ class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancellation_is_propagated(self):
         candidate = manager()
-        candidate.signal = AsyncMock(side_effect=asyncio.CancelledError)
+        candidate.prepare_entry = AsyncMock(side_effect=asyncio.CancelledError)
         with self.assertRaises(asyncio.CancelledError):
             await dispatch_signal([candidate], signal_result(), entry_eligible=True, market_fresh=True)
         self.assertIsNone(candidate.halted_reason)
@@ -323,7 +681,7 @@ class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
             candidate = ExecutionManager(*args, **kwargs)
             candidate.startup_check = AsyncMock()
             candidate.monitor = AsyncMock()
-            candidate.signal = AsyncMock(return_value='ORDER_REJECTED')
+            candidate.prepare_entry = AsyncMock(return_value='ORDER_REJECTED')
             executions.append(candidate)
             return candidate
         locks = [Mock(), Mock(), Mock()]
@@ -348,7 +706,7 @@ class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
         strategy.on_candle.assert_called_once()
         for candidate, lock in zip(executions, locks):
             candidate.startup_check.assert_awaited_once()
-            candidate.signal.assert_awaited_once()
+            candidate.prepare_entry.assert_awaited_once()
             lock.close.assert_called_once()
         api.close.assert_awaited_once()
 

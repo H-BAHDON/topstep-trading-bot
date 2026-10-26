@@ -61,7 +61,6 @@ class TradingConfig:
     emergency_halt: bool
     execution_poll_interval_seconds: float
     errors: tuple[str, ...]
-
     @classmethod
     def from_env(cls) -> "TradingConfig":
         errors: list[str] = []
@@ -257,6 +256,42 @@ class TradingConfig:
         )
 
 
+@dataclass(frozen=True)
+class PreparedEntry:
+    """An account-scoped entry reservation ready for exactly one submission."""
+
+    manager: "ExecutionManager"
+    payload: dict[str, Any]
+    tag: str
+    pre_entry_order_ids: frozenset[int]
+    signal_received_monotonic: float
+    preparation_started_monotonic: float
+    prepared_monotonic: float
+
+
+class EntryPreparationBatch:
+    """Barrier separating authoritative state reads from duplicate searches."""
+
+    def __init__(self, participants: list["ExecutionManager"]) -> None:
+        self._participants = frozenset(participants)
+        self._arrived: set[ExecutionManager] = set()
+        self._condition = asyncio.Condition()
+
+    async def state_snapshot_complete(self, manager: "ExecutionManager") -> None:
+        async with self._condition:
+            self._arrived.add(manager)
+            self._condition.notify_all()
+            await self._condition.wait_for(
+                lambda: self._arrived >= self._participants
+            )
+
+    async def participant_finished(self, manager: "ExecutionManager") -> None:
+        """Release peers when this participant exits before reaching the barrier."""
+        async with self._condition:
+            self._arrived.add(manager)
+            self._condition.notify_all()
+
+
 class ExecutionManager:
     def __init__(
         self,
@@ -282,6 +317,10 @@ class ExecutionManager:
         self.contract = contract
         self.config = config
         self.lock = asyncio.Lock()
+        self.entry_preparation_pending = asyncio.Event()
+        self.entry_preparation_cleared = asyncio.Event()
+        self.entry_preparation_cleared.set()
+        self.entry_preparation_waiters = 0
         self.halted_reason: str | None = None
         self.halted_code: str | None = None
         self.order_pending = False
@@ -731,9 +770,9 @@ class ExecutionManager:
             boundary -= timedelta(days=1)
         return boundary.astimezone(UTC)
 
-    async def daily_net_pnl(self) -> Decimal:
+    async def daily_net_pnl(self, *, priority: bool = False) -> Decimal:
         trades = await self.api.trades(
-            int(self.account["id"]), self.trading_day_start()
+            int(self.account["id"]), self.trading_day_start(), priority=priority
         )
         net = Decimal(0)
         for trade in trades:
@@ -768,11 +807,13 @@ class ExecutionManager:
             ],
         )
 
-    async def reconcile(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    async def reconcile(
+        self, *, priority: bool = False
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         account_id = int(self.account["id"])
         positions, orders = await asyncio.gather(
-            self.api.open_positions(account_id),
-            self.api.open_orders(account_id),
+            self.api.open_positions(account_id, priority=priority),
+            self.api.open_orders(account_id, priority=priority),
         )
         for record in [*positions, *orders]:
             self.validate_record_account(record)
@@ -1014,13 +1055,29 @@ class ExecutionManager:
                 )
                 else "CLOSE_UNCONFIRMED"
             )
-    async def signal(
+    async def prepare_entry(
         self,
         result: StrategyResult,
         *,
         entry_eligible: bool,
         market_fresh: bool,
-    ) -> str:
+        preparation_batch: EntryPreparationBatch | None = None,
+        signal_received_monotonic: float | None = None,
+    ) -> str | PreparedEntry:
+        """Validate and reserve one entry without sending an order mutation."""
+        loop = asyncio.get_running_loop()
+        preparation_started = loop.time()
+        signal_received = (
+            signal_received_monotonic
+            if signal_received_monotonic is not None
+            else preparation_started
+        )
+        logging.info(
+            "ENTRY PREPARATION START accountId=%s signal=%s signalElapsedMs=%.3f monotonic=%.6f",
+            self.account.get("id"), result.signal,
+            (preparation_started - signal_received) * 1000,
+            preparation_started,
+        )
         if self.approved_account is not None and not self.account_eligible():
             return "SAFETY_BLOCKED reasons=ACCOUNT_UNVERIFIED"
         if result.signal == "DATE_RANGE_EXIT":
@@ -1088,14 +1145,42 @@ class ExecutionManager:
             )
             return "SAFETY_BLOCKED reasons=" + ",".join(reason_codes)
 
-        async with self.lock:
+        self.entry_preparation_waiters += 1
+        self.entry_preparation_pending.set()
+        self.entry_preparation_cleared.clear()
+        lock_queued_at = loop.time()
+        logging.info(
+            "ENTRY LOCK QUEUE accountId=%s monotonic=%.6f",
+            self.account["id"], lock_queued_at,
+        )
+        try:
+            await self.lock.acquire()
+        finally:
+            self.entry_preparation_waiters -= 1
+            if not self.entry_preparation_waiters:
+                self.entry_preparation_pending.clear()
+                self.entry_preparation_cleared.set()
+        lock_acquired_at = loop.time()
+        logging.info(
+            "ENTRY LOCK ACQUIRED accountId=%s queueMs=%.3f monotonic=%.6f",
+            self.account["id"], (lock_acquired_at - lock_queued_at) * 1000,
+            lock_acquired_at,
+        )
+        reserved = False
+        try:
             if not self.entries_enabled:
                 return "ACCOUNT_PAUSED"
             if self.order_pending:
                 return "PENDING_BLOCKED"
             try:
-                positions, open_orders = await self.reconcile()
-                net = await self.daily_net_pnl()
+                positions, open_orders = await self.reconcile(priority=True)
+                net = (
+                    await self.daily_net_pnl(priority=True)
+                    if self.config.daily_loss_limit_enabled
+                    else self.realized_net
+                )
+                if preparation_batch is not None:
+                    await preparation_batch.state_snapshot_complete(self)
             except Exception as exc:
                 self.halt(f"pre-entry reconciliation failed: {type(exc).__name__}")
                 return "UNCERTAIN_BLOCKED"
@@ -1120,7 +1205,7 @@ class ExecutionManager:
                     positions[0], f"{result.signal}_REVERSAL"
                 ):
                     return "REVERSAL_CLOSE_UNCONFIRMED"
-                positions, open_orders = await self.reconcile()
+                positions, open_orders = await self.reconcile(priority=True)
                 if positions or open_orders:
                     self.halt("reversal cleanup left an unresolved position or order")
                     return "REVERSAL_STATE_UNCERTAIN"
@@ -1129,7 +1214,7 @@ class ExecutionManager:
 
             tag = self.custom_tag(result)
             existing = await self.api.orders(
-                int(self.account["id"]), self.trading_day_start()
+                int(self.account["id"]), self.trading_day_start(), priority=True
             )
             for record in existing:
                 self.validate_record_account(record)
@@ -1149,26 +1234,67 @@ class ExecutionManager:
             except (ProjectXError, KeyError, TypeError, ValueError) as exc:
                 self.halt(f"invalid protective bracket payload: {exc}")
                 return "BRACKET_INVALID"
+            prepared_at = loop.time()
             logging.info(
-                "ENTRY REQUEST accountId=%s signal=%s side=%s size=%s tag=%s hardStopTicks=%d",
+                "ENTRY PREPARED accountId=%s signal=%s side=%s size=%s tag=%s hardStopTicks=%d preparationMs=%.3f signalElapsedMs=%.3f monotonic=%.6f",
                 self.account["id"], result.signal,
                 "BUY" if side == 0 else "SELL",
                 payload["size"],
                 tag,
                 payload["stopLossBracket"]["ticks"],
+                (prepared_at - preparation_started) * 1000,
+                (prepared_at - signal_received) * 1000,
+                prepared_at,
             )
             self.order_pending = True
+            reserved = True
+            return PreparedEntry(
+                self,
+                payload,
+                tag,
+                frozenset(int(order["id"]) for order in open_orders),
+                signal_received,
+                preparation_started,
+                prepared_at,
+            )
+        finally:
+            if not reserved:
+                self.lock.release()
+
+    async def submit_prepared_entry(self, prepared: PreparedEntry) -> str:
+        """Submit one reserved entry exactly once, then verify it independently."""
+        if prepared.manager is not self or not self.lock.locked() or not self.order_pending:
+            raise ProjectXError("entry submission requires this account's active reservation")
+        payload = prepared.payload
+        tag = prepared.tag
+        submitted_at = asyncio.get_running_loop().time()
+        logging.info(
+            "ENTRY SUBMISSION START accountId=%s side=%s size=%s tag=%s hardStopTicks=%d preparationToSubmitMs=%.3f signalToSubmitMs=%.3f monotonic=%.6f",
+            self.account["id"],
+            "BUY" if payload["side"] == 0 else "SELL",
+            payload["size"],
+            tag,
+            payload["stopLossBracket"]["ticks"],
+            (submitted_at - prepared.prepared_monotonic) * 1000,
+            (submitted_at - prepared.signal_received_monotonic) * 1000,
+            submitted_at,
+        )
+        try:
             try:
                 response = await self.api.place_order_once(payload)
             except Exception as exc:
                 self.halt(f"order state uncertain: {type(exc).__name__}")
                 return "ORDER_UNCERTAIN"
-            finally:
-                if self.halted_reason:
-                    self.order_pending = False
 
+            acknowledged_at = asyncio.get_running_loop().time()
+            logging.info(
+                "ENTRY BROKER ACK accountId=%s success=%s postMs=%.3f signalToAckMs=%.3f orderId=%s monotonic=%.6f",
+                self.account["id"], bool(response.get("success")),
+                (acknowledged_at - submitted_at) * 1000,
+                (acknowledged_at - prepared.signal_received_monotonic) * 1000,
+                response.get("orderId"), acknowledged_at,
+            )
             if not response.get("success"):
-                self.order_pending = False
                 logging.error(
                     "ORDER REJECTED orderId=%s code=%s message=%r",
                     response.get("orderId"),
@@ -1182,12 +1308,37 @@ class ExecutionManager:
 
             order_id = response.get("orderId")
             logging.info("ORDER ACCEPTED orderId=%s tag=%s", order_id, tag)
-            try:
-                return await self.verify_entry(
-                    order_id, tag, {int(order["id"]) for order in open_orders}
-                )
-            finally:
-                self.order_pending = False
+            return await self.verify_entry(
+                order_id, tag, set(prepared.pre_entry_order_ids)
+            )
+        finally:
+            self.order_pending = False
+            self.lock.release()
+
+    def abort_prepared_entry(self, prepared: PreparedEntry) -> None:
+        """Release a reservation if dispatch is cancelled before submission."""
+        if prepared.manager is not self:
+            return
+        self.order_pending = False
+        if self.lock.locked():
+            self.lock.release()
+
+    async def signal(
+        self,
+        result: StrategyResult,
+        *,
+        entry_eligible: bool,
+        market_fresh: bool,
+    ) -> str:
+        """Compatibility path for one account; multi-account dispatch is two-phase."""
+        prepared = await self.prepare_entry(
+            result,
+            entry_eligible=entry_eligible,
+            market_fresh=market_fresh,
+        )
+        if isinstance(prepared, str):
+            return prepared
+        return await self.submit_prepared_entry(prepared)
 
     async def verify_fast_oco_closure(
         self, entry: dict[str, Any], orders: list[dict[str, Any]],
@@ -2020,8 +2171,51 @@ class ExecutionManager:
                 )
 
     async def monitor_once(self) -> str:
-        async with self.lock:
+        await self._acquire_monitor_lock()
+        try:
             return await self._monitor_once_locked()
+        finally:
+            self.lock.release()
+
+    async def _acquire_monitor_lock(self) -> None:
+        """Let pending entry preparation overtake a not-yet-started monitor cycle."""
+        while True:
+            if self.entry_preparation_pending.is_set():
+                await self.entry_preparation_cleared.wait()
+                continue
+            lock_waiter = asyncio.create_task(self.lock.acquire())
+            entry_waiter = asyncio.create_task(self.entry_preparation_pending.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    (lock_waiter, entry_waiter),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if entry_waiter in done:
+                    if lock_waiter.done() and lock_waiter.result():
+                        self.lock.release()
+                    else:
+                        lock_waiter.cancel()
+                        await asyncio.gather(lock_waiter, return_exceptions=True)
+                    await self.entry_preparation_cleared.wait()
+                    continue
+                entry_waiter.cancel()
+                await asyncio.gather(entry_waiter, return_exceptions=True)
+                return
+            except BaseException:
+                for waiter in (lock_waiter, entry_waiter):
+                    if not waiter.done():
+                        waiter.cancel()
+                await asyncio.gather(
+                    lock_waiter, entry_waiter, return_exceptions=True
+                )
+                if lock_waiter.done() and not lock_waiter.cancelled():
+                    try:
+                        acquired = lock_waiter.result()
+                    except BaseException:
+                        acquired = False
+                    if acquired and self.lock.locked():
+                        self.lock.release()
+                raise
 
     async def _monitor_once_locked(self) -> str:
         if self.order_pending:

@@ -128,22 +128,22 @@ class FakeApi:
         self.close_calls: list[dict] = []
         self.close_response = {"success": True, "errorCode": 0}
 
-    async def open_positions(self, account_id):
+    async def open_positions(self, account_id, *, priority=False):
         if self.open_positions_sequence:
             return self.open_positions_sequence.pop(0)
         return self.positions_response
 
-    async def open_orders(self, account_id):
+    async def open_orders(self, account_id, *, priority=False):
         if self.open_orders_sequence:
             return self.open_orders_sequence.pop(0)
         return self.open_orders_response
 
-    async def orders(self, account_id, start, end=None):
+    async def orders(self, account_id, start, end=None, *, priority=False):
         if self.orders_sequence:
             return self.orders_sequence.pop(0)
         return self.orders_response
 
-    async def trades(self, account_id, start, end=None):
+    async def trades(self, account_id, start, end=None, *, priority=False):
         if self.trades_sequence:
             return self.trades_sequence.pop(0)
         return self.trades_response

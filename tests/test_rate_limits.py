@@ -3,7 +3,7 @@ import unittest
 from collections import deque
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import httpx
 
@@ -12,6 +12,41 @@ from test_multi_account import manager
 
 
 class RequestBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_priority_reads_burst_and_run_before_waiting_background(self):
+        budget = RequestBudget()
+        starts = []
+
+        async def priority_read():
+            await budget.acquire(priority=True)
+            starts.append(asyncio.get_running_loop().time())
+
+        await asyncio.gather(*(priority_read() for _ in range(6)))
+
+        self.assertEqual(len(starts), 6)
+        self.assertLess(max(starts) - min(starts), 0.05)
+        background_started = asyncio.get_running_loop().time()
+        await budget.acquire()
+        self.assertGreaterEqual(
+            asyncio.get_running_loop().time() - background_started, 0.35
+        )
+
+    async def test_priority_reads_still_wait_when_rolling_capacity_is_exhausted(self):
+        budget = RequestBudget()
+        clock = SimpleNamespace(value=100.0)
+        clock.time = lambda: clock.value
+        budget.requests = deque([100.0] * 160)
+
+        async def sleep(seconds):
+            clock.value += seconds
+
+        with patch('topstep_api.asyncio.get_running_loop', return_value=clock), patch(
+            'topstep_api.asyncio.sleep', side_effect=sleep
+        ):
+            await budget.acquire(priority=True)
+
+        self.assertGreaterEqual(clock.value, 160.0)
+        self.assertEqual(len(budget.requests), 1)
+
     async def test_reads_share_spacing_but_mutations_have_reserved_capacity(self):
         budget = RequestBudget()
         clock = SimpleNamespace(value=100.0)
@@ -69,9 +104,15 @@ class RequestBudgetTests(unittest.IsolatedAsyncioTestCase):
             httpx.Response(200, request=request, json={'success': True, 'positions': []}),
         ]))
         with patch('topstep_api.asyncio.sleep', new_callable=AsyncMock):
-            result = await api.request('/api/Position/searchOpen', {'accountId': 2})
+            result = await api.request(
+                '/api/Position/searchOpen', {'accountId': 2}, priority=True
+            )
         self.assertEqual(result['positions'], [])
         self.assertEqual(api.request_budget.acquire.await_count, 2)
+        self.assertEqual(
+            api.request_budget.acquire.await_args_list,
+            [call(priority=True), call(priority=True)],
+        )
         api.request_budget.cooldown.assert_called_once_with(2)
 
 

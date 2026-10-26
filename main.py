@@ -16,7 +16,9 @@ from zoneinfo import ZoneInfoNotFoundError
 
 from dotenv import dotenv_values, load_dotenv
 
-from execution import ExecutionManager, TradingConfig
+from execution import (
+    EntryPreparationBatch, ExecutionManager, PreparedEntry, TradingConfig,
+)
 from strategies.base import StrategyResult
 from strategies.test_long import TestLongStrategy
 from strategies.ema12_hourly_trailing import Ema12HourlyTrailingStrategy, HourlyEmaResult
@@ -246,9 +248,54 @@ async def verify_configured_account(api: ProjectX, accounts: list[dict], setting
 
 
 async def dispatch_signal(executions: list[ExecutionManager], result, **kwargs) -> dict[int, str]:
-    async def deliver(execution):
+    loop = asyncio.get_running_loop()
+    signal_received = loop.time()
+    logging.info(
+        "SIGNAL RECEIVED signal=%s accountIds=%s monotonic=%.6f",
+        result.signal, [execution.account["id"] for execution in executions],
+        signal_received,
+    )
+    preparation_batch = EntryPreparationBatch(executions)
+
+    async def prepare(execution):
         try:
-            status = await execution.signal(result, **kwargs)
+            outcome = await execution.prepare_entry(
+                result,
+                preparation_batch=preparation_batch,
+                signal_received_monotonic=signal_received,
+                **kwargs,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            execution.halt("entry preparation failed; broker state must be reconciled")
+            logging.exception("Entry preparation failed accountId=%s", execution.account["id"])
+            outcome = "UNCERTAIN_BLOCKED"
+        finally:
+            await preparation_batch.participant_finished(execution)
+        return execution, outcome
+
+    preparation_tasks = [
+        asyncio.create_task(prepare(execution)) for execution in executions
+    ]
+    try:
+        prepared_results = await asyncio.gather(*preparation_tasks)
+    except BaseException:
+        for task in preparation_tasks:
+            task.cancel()
+        completed = await asyncio.gather(*preparation_tasks, return_exceptions=True)
+        for item in completed:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[1], PreparedEntry)
+            ):
+                item[0].abort_prepared_entry(item[1])
+        raise
+
+    async def submit(execution, prepared):
+        try:
+            status = await execution.submit_prepared_entry(prepared)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -257,7 +304,26 @@ async def dispatch_signal(executions: list[ExecutionManager], result, **kwargs) 
             status = "UNCERTAIN_BLOCKED"
         logging.info("Signal result accountId=%s status=%s", execution.account["id"], status)
         return int(execution.account["id"]), status
-    return dict(await asyncio.gather(*(deliver(execution) for execution in executions)))
+
+    statuses = {
+        int(execution.account["id"]): outcome
+        for execution, outcome in prepared_results
+        if isinstance(outcome, str)
+    }
+    submissions = [
+        submit(execution, outcome)
+        for execution, outcome in prepared_results
+        if isinstance(outcome, PreparedEntry)
+    ]
+    if submissions:
+        statuses.update(dict(await asyncio.gather(*submissions)))
+    for execution, outcome in prepared_results:
+        if isinstance(outcome, str):
+            logging.info(
+                "Signal result accountId=%s status=%s",
+                execution.account["id"], outcome,
+            )
+    return statuses
 
 
 async def run_bot_tasks(feed_task, workers) -> None:
