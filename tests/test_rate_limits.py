@@ -91,6 +91,18 @@ class MarketPayloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(feed.current.volume, 0)
             self.assertEqual(feed.unexpected_payload_count, 0)
 
+    async def test_trade_update_publishes_validated_live_price(self):
+        feed = MarketDataFeed(Mock(), {'id': 'MNQ'}, False)
+        observed = []
+        feed.add_live_price_handler(observed.append)
+        await feed.update_live_candle({
+            'timestamp': '2026-10-25T22:52:23Z',
+            'price': 25000.25,
+            'volume': 1,
+        })
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]['lastPrice'], 25000.25)
+
     async def test_invalid_fields_are_still_rejected(self):
         for field in ({'price': True}, {'volume': True}, {'timestamp': True}, {'price': 'NaN'}, {'timestamp': 'bad'}):
             feed = MarketDataFeed(Mock(), {'id': 'MNQ'}, False)

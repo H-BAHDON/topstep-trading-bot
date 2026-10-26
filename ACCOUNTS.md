@@ -22,6 +22,8 @@ Example Express entry (replace both placeholders with the broker identity):
       "account_type": "express",
       "enabled": true,
       "contracts": 1,
+      "trail_activation_points": "10",
+      "trail_distance_points": "1.75",
       "daily_loss_limit_enabled": true,
       "max_daily_loss_usd": "100"
     }
@@ -30,8 +32,10 @@ Example Express entry (replace both placeholders with the broker identity):
 ```
 
 Append entries to the `accounts` list to add accounts. Restart to apply changes.
-Optional sizing and loss settings override the strategy/environment defaults
-for that account. All accounts share the selected strategy and market feed.
+Optional sizing, trailing, and loss settings override the strategy/environment
+defaults for that account. Trailing point values must be positive multiples of
+the 0.25-point MNQ tick size. All accounts share the selected strategy and
+market feed.
 
 `enabled: false` prevents new entries while retaining position reconciliation,
 protective/trailing stop management, and strategy exits. Keep an account in the

@@ -73,6 +73,10 @@ class AccountConfigurationTests(unittest.TestCase):
             {'contracts': 1.5}, {'daily_loss_limit_enabled': 'false'},
             {'max_daily_loss_usd': 'NaN'}, {'max_daily_loss_usd': -1},
             {'max_daily_loss_usd': 'Infinity'}, {'max_daily_loss_usd': True},
+            {'trail_activation_points': 'NaN'}, {'trail_activation_points': 0},
+            {'trail_activation_points': '1.1'}, {'trail_activation_points': True},
+            {'trail_distance_points': 'Infinity'}, {'trail_distance_points': -1},
+            {'trail_distance_points': '1.1'}, {'trail_distance_points': False},
             {'verified_practice_account_id': 555},
             {'practice_account_simulated_verified': True},
         ):
@@ -99,13 +103,22 @@ class AccountConfigurationTests(unittest.TestCase):
 
     def test_account_overrides_are_independent_and_preserve_shared_settings(self):
         base = config()
-        first = account_trading_config(base, settings(contracts=2, max_daily_loss_usd='50.25'))
+        first = account_trading_config(base, settings(
+            contracts=2,
+            max_daily_loss_usd='50.25',
+            trail_activation_points='10',
+            trail_distance_points='1.75',
+        ))
         second = account_trading_config(base, settings(2, contracts=3, daily_loss_limit_enabled=False))
         self.assertEqual((first.contracts, second.contracts, base.contracts), (2, 3, 1))
         self.assertEqual(first.max_daily_loss_usd, Decimal('50.25'))
         self.assertFalse(second.daily_loss_limit_enabled)
         self.assertTrue(first.daily_loss_limit_enabled)
         self.assertEqual(first.stop_loss_points, base.stop_loss_points)
+        self.assertEqual(first.trail_activation_points, Decimal('10'))
+        self.assertEqual(first.trail_distance_ticks, 7)
+        self.assertEqual(second.trail_activation_points, base.trail_activation_points)
+        self.assertEqual(second.trail_distance_ticks, base.trail_distance_ticks)
 
 
 class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):

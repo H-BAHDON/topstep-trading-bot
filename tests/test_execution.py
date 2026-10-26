@@ -867,6 +867,117 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "WAITING_FOR_TRAIL_ACTIVATION")
         self.assertEqual(api.place_calls, [])
 
+    async def test_live_price_crossing_latches_and_submits_only_once(self) -> None:
+        manager = self.manager()
+        pos = position(LONG_POSITION, 100)
+        manager.last_positions = [pos]
+        manager.confirmed_position_id = 11
+        manager.confirmed_stop_order_id = 61
+        manager.activate_native_trailing = AsyncMock(
+            return_value="NATIVE_TRAILING_ACTIVE"
+        )
+
+        manager.observe_live_price({"lastPrice": 102.75})
+        self.assertIsNone(manager.live_trailing_latched_position_id)
+        manager.observe_live_price({"lastPrice": 103})
+        manager.observe_live_price({"lastPrice": 104})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        self.assertEqual(manager.live_trailing_latched_position_id, 11)
+        manager.activate_native_trailing.assert_awaited_once_with(
+            pos, [], Decimal("103"), skip_history_preflight=False
+        )
+
+    async def test_live_price_crossing_uses_short_direction(self) -> None:
+        manager = self.manager()
+        pos = position(SHORT_POSITION, 100)
+        manager.last_positions = [pos]
+        manager.confirmed_position_id = 11
+        manager.confirmed_stop_order_id = 71
+        manager.activate_native_trailing = AsyncMock(
+            return_value="NATIVE_TRAILING_ACTIVE"
+        )
+
+        manager.observe_live_price({"lastPrice": 97.25})
+        self.assertIsNone(manager.live_trailing_latched_position_id)
+        manager.observe_live_price({"lastPrice": 97})
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        manager.activate_native_trailing.assert_awaited_once_with(
+            pos, [], Decimal("97"), skip_history_preflight=False
+        )
+
+    async def test_local_entry_stream_activation_skips_history_preflight(self) -> None:
+        api = FakeApi()
+        api.orders = AsyncMock(return_value=[])
+        api.quote_response = {
+            "lastPrice": 103,
+            "bestBid": 102.75,
+            "bestAsk": 103.25,
+            "ageSeconds": 0,
+            "timestamp": "2026-10-14T14:54:10Z",
+        }
+        api.place_response = {
+            "success": False,
+            "errorCode": 2,
+            "errorMessage": "mock trailing rejection",
+            "orderId": 62,
+        }
+        manager = self.manager(api)
+        pos = position(LONG_POSITION, 100)
+        manager.last_positions = [pos]
+        manager.confirmed_position_id = 11
+        manager.confirmed_stop_order_id = 61
+        manager.locally_opened_position_id = 11
+
+        await manager._activate_native_trailing_from_stream(11, Decimal("103"))
+
+        api.orders.assert_not_awaited()
+        self.assertEqual(len(api.place_calls), 1)
+
+    async def test_rest_monitor_yields_to_latched_live_activation(self) -> None:
+        api = FakeApi()
+        api.orders = AsyncMock(return_value=[])
+        pos = position(LONG_POSITION, 100)
+        api.positions_response = [pos]
+        api.open_orders_response = [stop(61, 1, 90)]
+        manager = self.manager(api)
+        manager.last_positions = [pos]
+        manager.live_trailing_latched_position_id = 11
+
+        outcome = await manager.monitor_once()
+
+        self.assertEqual(outcome, "LIVE_TRAILING_ACTIVATION_PENDING")
+        api.orders.assert_not_awaited()
+        self.assertEqual(api.place_calls, [])
+
+    async def test_stream_activation_reprices_after_history_preflight(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        api.quote_response = {
+            "lastPrice": 105,
+            "bestBid": 104.75,
+            "bestAsk": 105.25,
+            "ageSeconds": 0,
+            "timestamp": "2026-10-14T14:54:10Z",
+        }
+        api.place_response = {
+            "success": False,
+            "errorCode": 2,
+            "errorMessage": "mock trailing rejection",
+            "orderId": 62,
+        }
+        manager = self.manager(api)
+
+        outcome = await manager.activate_native_trailing(
+            pos, [], Decimal("103")
+        )
+
+        self.assertEqual(outcome, "NATIVE_TRAILING_REJECTED_HARD_STOP_ACTIVE")
+        self.assertEqual(api.place_calls[0]["trailPrice"], 104.0)
+
     async def test_native_trailing_is_submitted_only_once_per_position(self) -> None:
         api = FakeApi()
         pos = position(LONG_POSITION, 100)

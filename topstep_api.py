@@ -25,6 +25,7 @@ RECORD_SEPARATOR = "\x1e"
 MNQ_SYMBOL = "F.US.MNQ"
 UTC = timezone.utc
 ClosedCandleHandler = Callable[["Candle", bool], Awaitable[None]]
+LivePriceHandler = Callable[[dict[str, Any]], Any]
 
 
 class ProjectXError(RuntimeError):
@@ -472,6 +473,24 @@ class MarketDataFeed:
         self.seen_trade_keys: set[tuple[Any, ...]] = set()
         self.max_seen_trades = 20_000
         self.unexpected_payload_count = 0
+        self.live_price_handlers: list[LivePriceHandler] = []
+
+    def add_live_price_handler(self, handler: LivePriceHandler) -> None:
+        """Register a non-blocking observer for validated live prices."""
+        self.live_price_handlers.append(handler)
+
+    def publish_live_price(self, price: float, timestamp: datetime) -> None:
+        update = {
+            "lastPrice": price,
+            "timestamp": timestamp.isoformat(),
+        }
+        for handler in tuple(self.live_price_handlers):
+            try:
+                result = handler(update)
+                if result is not None:
+                    raise TypeError("live price handlers must not block or return a value")
+            except Exception:
+                logging.exception("Live price handler failed")
 
     async def bootstrap(self) -> list[Candle]:
         bars = await self.api.bars(self.contract["id"], self.live, 300)
@@ -611,6 +630,7 @@ class MarketDataFeed:
         bucket = minute_start(trade_time)
         self.last_price = price
         self.last_market_update = now_utc()
+        self.publish_live_price(price, trade_time)
         if self.current is None or bucket > self.current.time:
             self.current = Candle(bucket, price, price, price, price, size)
         elif bucket == self.current.time:
@@ -701,6 +721,7 @@ class MarketDataFeed:
                                     parsed = float(value)
                                     if math.isfinite(parsed):
                                         self.last_price = parsed
+                                        self.publish_live_price(parsed, now_utc())
                                 if (
                                     bid_value is not None
                                     and ask_value is not None

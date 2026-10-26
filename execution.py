@@ -314,6 +314,8 @@ class ExecutionManager:
         self.trail_ticks = config.trail_distance_ticks
         self.active_trail_activation_points: Decimal | None = None
         self.active_trail_ticks: int | None = None
+        self.live_trailing_latched_position_id: int | None = None
+        self.locally_opened_position_id: int | None = None
 
     async def update_runtime_setting(self, setting: str, value: str) -> str:
         """Update the settings used for future entries without restarting."""
@@ -927,6 +929,8 @@ class ExecutionManager:
         self.confirmed_position_size = None
         self.active_trail_activation_points = None
         self.active_trail_ticks = None
+        self.live_trailing_latched_position_id = None
+        self.locally_opened_position_id = None
         self.last_positions = []
 
     async def close_strategy_position(
@@ -1268,6 +1272,7 @@ class ExecutionManager:
         self.confirmed_position_id = None
         self.confirmed_position_type = None
         self.confirmed_position_size = None
+        self.locally_opened_position_id = None
         self.last_positions = []
         return True
 
@@ -1404,6 +1409,7 @@ class ExecutionManager:
                     self.confirmed_position_id = int(position["id"])
                     self.confirmed_position_type = int(position["type"])
                     self.confirmed_position_size = int(position["size"])
+                    self.locally_opened_position_id = int(position["id"])
                     logging.info(
                         "FILL AND INITIAL PROTECTION CONFIRMED entryOrderId=%s "
                         "positionId=%s entryPrice=%s requestedSize=%s fillVolume=%s "
@@ -1731,6 +1737,8 @@ class ExecutionManager:
         self,
         position: dict[str, Any],
         orders: list[dict[str, Any]],
+        observed_last_price: Decimal | None = None,
+        skip_history_preflight: bool = False,
     ) -> str:
         position_id = int(position["id"])
         trailing_candidates = self.matching_exit_orders(
@@ -1748,10 +1756,13 @@ class ExecutionManager:
         if self.trailing_attempted_position_id == position_id:
             return "NATIVE_TRAILING_ALREADY_ATTEMPTED"
 
-        quote = self.quote_source.quote_snapshot()
-        if quote is None or quote.get("lastPrice") is None:
-            return "WAITING_FOR_FRESH_QUOTE"
-        last_price = Decimal(str(quote["lastPrice"]))
+        if observed_last_price is None:
+            quote = self.quote_source.quote_snapshot()
+            if quote is None or quote.get("lastPrice") is None:
+                return "WAITING_FOR_FRESH_QUOTE"
+            last_price = Decimal(str(quote["lastPrice"]))
+        else:
+            last_price = observed_last_price
         entry_price = Decimal(str(position["averagePrice"]))
         favorable_points = (
             last_price - entry_price
@@ -1761,54 +1772,72 @@ class ExecutionManager:
         if favorable_points < self.position_trail_activation_points:
             return "WAITING_FOR_TRAIL_ACTIVATION"
 
-        payload = self.native_trailing_payload(position, last_price)
-        prior_orders = await self.api.orders(
-            int(self.account["id"]), self.trading_day_start()
-        )
-        prior = next(
-            (
-                order for order in prior_orders
-                if order.get("customTag") == payload["customTag"]
-            ),
-            None,
-        )
-        if prior is not None:
-            self.trailing_attempted_position_id = position_id
-            prior_id = prior.get("id")
-            prior_status = prior.get("status")
-            if prior_id is not None:
-                self.native_trailing_order_id = int(prior_id)
-            logging.warning(
-                "NATIVE TRAILING NOT RESUBMITTED positionId=%s orderId=%s "
-                "brokerStatus=%s tag=%s",
-                position_id,
-                prior_id,
-                prior_status,
-                payload["customTag"],
+        custom_tag = f"mnq-trail-position-{position_id}"
+        if not skip_history_preflight:
+            prior_orders = await self.api.orders(
+                int(self.account["id"]), self.trading_day_start()
             )
-            if prior_status in OPEN_OR_PENDING_STATUSES:
-                return "NATIVE_TRAILING_ALREADY_SUBMITTED"
-            if prior_status == FILLED_STATUS:
-                self.halt(
-                    "native trailing is filled while its position remains open"
+            prior = next(
+                (
+                    order for order in prior_orders
+                    if order.get("customTag") == custom_tag
+                ),
+                None,
+            )
+            if prior is not None:
+                self.trailing_attempted_position_id = position_id
+                prior_id = prior.get("id")
+                prior_status = prior.get("status")
+                if prior_id is not None:
+                    self.native_trailing_order_id = int(prior_id)
+                logging.warning(
+                    "NATIVE TRAILING NOT RESUBMITTED positionId=%s orderId=%s "
+                    "brokerStatus=%s tag=%s",
+                    position_id,
+                    prior_id,
+                    prior_status,
+                    custom_tag,
                 )
-                return "NATIVE_TRAILING_FILL_POSITION_MISMATCH"
-            return "NATIVE_TRAILING_PRIOR_ATTEMPT_FOUND"
+                if prior_status in OPEN_OR_PENDING_STATUSES:
+                    return "NATIVE_TRAILING_ALREADY_SUBMITTED"
+                if prior_status == FILLED_STATUS:
+                    self.halt(
+                        "native trailing is filled while its position remains open"
+                    )
+                    return "NATIVE_TRAILING_FILL_POSITION_MISMATCH"
+                return "NATIVE_TRAILING_PRIOR_ATTEMPT_FOUND"
+
+        # Re-read the stream snapshot immediately before submission. Recovered
+        # positions retain the history preflight above; locally opened positions
+        # use the in-memory latch and unique tag to take the direct fast path.
+        submission_price = last_price
+        submission_quote = self.quote_source.quote_snapshot()
+        if submission_quote is not None and submission_quote.get("lastPrice") is not None:
+            try:
+                candidate = Decimal(str(submission_quote["lastPrice"]))
+                if candidate.is_finite():
+                    submission_price = candidate
+            except (InvalidOperation, TypeError, ValueError):
+                pass
+        payload = self.native_trailing_payload(position, submission_price)
         self.trailing_attempted_position_id = position_id
         logging.info(
             "NATIVE TRAILING REQUEST positionId=%s direction=%s entryPrice=%s "
-            "lastPrice=%s favorablePoints=%s side=%s size=%s trailPrice=%s "
-            "distanceTicks=%s hardStopOrderId=%s",
+            "activationPrice=%s submissionPrice=%s favorablePoints=%s "
+            "side=%s size=%s trailPrice=%s "
+            "distanceTicks=%s hardStopOrderId=%s fastPath=%s",
             position_id,
             "LONG" if int(position["type"]) == LONG_POSITION else "SHORT",
             entry_price,
             last_price,
+            submission_price,
             favorable_points,
             "SELL" if payload["side"] == 1 else "BUY",
             payload["size"],
             payload["trailPrice"],
             self.position_trail_ticks,
             self.confirmed_stop_order_id,
+            skip_history_preflight,
         )
         try:
             response = await self.api.place_order_once(payload)
@@ -1907,6 +1936,89 @@ class ExecutionManager:
         )
         return "NATIVE_TRAILING_UNCERTAIN"
 
+    def observe_live_price(self, quote: dict[str, Any]) -> None:
+        """Latch a qualifying stream price without waiting for REST polling."""
+        if (
+            not self.config.enabled
+            or self.config.trail_management_mode != "native_delayed"
+            or self.halted_reason
+            or self.order_pending
+            or self.native_trailing_active
+            or self.trailing_attempted_position_id is not None
+            or len(self.last_positions) != 1
+            or self.confirmed_position_id is None
+            or self.confirmed_stop_order_id is None
+        ):
+            return
+        position = self.last_positions[0]
+        position_id = int(position.get("id", -1))
+        if (
+            position_id != self.confirmed_position_id
+            or self.live_trailing_latched_position_id == position_id
+        ):
+            return
+        try:
+            last_price = Decimal(str(quote["lastPrice"]))
+            if not last_price.is_finite():
+                return
+            entry_price = Decimal(str(position["averagePrice"]))
+            favorable_points = (
+                last_price - entry_price
+                if int(position["type"]) == LONG_POSITION
+                else entry_price - last_price
+            )
+        except (KeyError, InvalidOperation, TypeError, ValueError):
+            return
+        if favorable_points < self.position_trail_activation_points:
+            return
+
+        # This method is called synchronously by the stream reader. Setting the
+        # latch before scheduling makes a burst of qualifying ticks idempotent.
+        self.live_trailing_latched_position_id = position_id
+        logging.info(
+            "LIVE TRAILING ACTIVATION OBSERVED positionId=%s lastPrice=%s "
+            "favorablePoints=%s",
+            position_id,
+            last_price,
+            favorable_points,
+        )
+        asyncio.create_task(
+            self._activate_native_trailing_from_stream(position_id, last_price)
+        )
+
+    async def _activate_native_trailing_from_stream(
+        self, position_id: int, observed_last_price: Decimal
+    ) -> None:
+        async with self.lock:
+            if (
+                self.halted_reason
+                or self.order_pending
+                or self.native_trailing_active
+                or self.trailing_attempted_position_id is not None
+                or len(self.last_positions) != 1
+                or int(self.last_positions[0].get("id", -1)) != position_id
+                or self.confirmed_position_id != position_id
+                or self.confirmed_stop_order_id is None
+            ):
+                return
+            try:
+                outcome = await self.activate_native_trailing(
+                    self.last_positions[0], [], observed_last_price,
+                    skip_history_preflight=(
+                        self.locally_opened_position_id == position_id
+                    ),
+                )
+                logging.info(
+                    "LIVE TRAILING ACTIVATION RESULT positionId=%s outcome=%s",
+                    position_id,
+                    outcome,
+                )
+            except Exception as exc:
+                self.halt(
+                    "live trailing activation failed: "
+                    f"positionId={position_id} error={type(exc).__name__}"
+                )
+
     async def monitor_once(self) -> str:
         async with self.lock:
             return await self._monitor_once_locked()
@@ -1967,6 +2079,8 @@ class ExecutionManager:
             self.native_trailing_order_id = None
             self.native_trailing_active = False
             self.trailing_attempted_position_id = None
+            self.live_trailing_latched_position_id = None
+            self.locally_opened_position_id = None
             self.confirmed_position_id = None
             self.confirmed_position_type = None
             self.confirmed_position_size = None
@@ -2038,6 +2152,8 @@ class ExecutionManager:
                 self.confirmed_take_profit_order_id = int(take_profit["id"])
                 if self.config.trail_management_mode == "fixed_oco":
                     return "FIXED_OCO_ACTIVE"
+            if self.live_trailing_latched_position_id == int(position["id"]):
+                return "LIVE_TRAILING_ACTIVATION_PENDING"
             return await self.activate_native_trailing(position, orders)
         self.last_positions = []
         return "FLAT"

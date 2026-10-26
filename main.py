@@ -155,6 +155,17 @@ def load_account_configuration(path: Path) -> list[dict]:
                 limit = Decimal(str(account["max_daily_loss_usd"]))
                 if not limit.is_finite() or limit <= 0:
                     raise ValueError("max_daily_loss_usd must be a positive finite number")
+            for field in ("trail_activation_points", "trail_distance_points"):
+                if field not in account:
+                    continue
+                if isinstance(account[field], bool):
+                    raise ValueError(f"{field} must be a positive finite number")
+                points = Decimal(str(account[field]))
+                if not points.is_finite() or points <= 0:
+                    raise ValueError(f"{field} must be a positive finite number")
+                ticks = points / Decimal("0.25")
+                if ticks != ticks.to_integral_value():
+                    raise ValueError(f"{field} must convert to whole 0.25-point MNQ ticks")
             normalized.append(account)
         return normalized
     except (OSError, ValueError, KeyError, TypeError, InvalidOperation) as exc:
@@ -185,6 +196,13 @@ def account_trading_config(base: TradingConfig, settings: dict) -> TradingConfig
     changes = {key: settings[key] for key in ("contracts", "daily_loss_limit_enabled") if key in settings}
     if "max_daily_loss_usd" in settings:
         changes["max_daily_loss_usd"] = Decimal(str(settings["max_daily_loss_usd"]))
+    if "trail_activation_points" in settings:
+        changes["trail_activation_points"] = Decimal(
+            str(settings["trail_activation_points"])
+        )
+    if "trail_distance_points" in settings:
+        distance = Decimal(str(settings["trail_distance_points"]))
+        changes["trail_distance_ticks"] = int(distance / Decimal("0.25"))
     return replace(base, **changes)
 
 
@@ -402,6 +420,8 @@ async def async_main() -> None:
             )
             for account, account_settings in zip(selected_accounts, settings)
         ]
+        for execution in executions:
+            feed.add_live_price_handler(execution.observe_live_price)
         pause_store = PauseStateStore(Path(__file__).resolve().parent / "runtime" / "account_controls.db")
         telegrams = []
         for execution in executions:
