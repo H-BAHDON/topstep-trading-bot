@@ -655,14 +655,20 @@ class ExecutionManager:
             ):
                 errors.append("CONTRACTS exceeds BROKER_MAX_MNQ_CONTRACTS")
         else:
-            if self.config.trail_management_mode != "native_delayed":
-                errors.append("TRAIL_MANAGEMENT_MODE must be native_delayed")
-            if min(self.stop_ticks, self.activation_ticks, self.trail_ticks) <= 0:
-                errors.append("stop and trailing points must convert to whole positive ticks")
-            if (
-                self.config.take_profit_points is not None
-                and self.take_profit_ticks <= 0
-            ):
+            if self.config.trail_management_mode not in {
+                "native_delayed", "fixed_oco"
+            }:
+                errors.append(
+                    "TRAIL_MANAGEMENT_MODE must be native_delayed or fixed_oco"
+                )
+            elif self.config.trail_management_mode == "native_delayed":
+                if min(self.stop_ticks, self.activation_ticks, self.trail_ticks) <= 0:
+                    errors.append("stop and trailing points must convert to whole positive ticks")
+            elif self.config.take_profit_points is None:
+                errors.append("fixed Auto OCO exits require a take profit")
+            if self.stop_ticks <= 0:
+                errors.append("stop points must convert to whole positive ticks")
+            if self.config.take_profit_points is not None and self.take_profit_ticks <= 0:
                 errors.append("take-profit points must convert to whole positive ticks")
         if not self.account_eligible():
             errors.append(

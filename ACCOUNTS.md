@@ -24,6 +24,7 @@ Example Express entry (replace both placeholders with the broker identity):
       "contracts": 1,
       "stop_loss_points": "40",
       "take_profit_points": "25",
+      "trailing_enabled": true,
       "trail_activation_points": "10",
       "trail_distance_points": "1.75",
       "daily_loss_limit_enabled": true,
@@ -35,9 +36,12 @@ Example Express entry (replace both placeholders with the broker identity):
 
 Append entries to the `accounts` list to add accounts. Restart to apply changes.
 Optional sizing, trailing, and loss settings override the strategy/environment
-defaults for that account. Trailing point values must be positive multiples of
-the 0.25-point MNQ tick size. All accounts share the selected strategy and
-market feed.
+defaults for that account. Set `trailing_enabled` to `false` to retain the
+broker-side hard stop and take-profit OCO bracket without submitting a trailing
+order. Existing broker orders are not cancelled by this setting, and omitted
+settings preserve the strategy default. Trailing point values must be positive
+multiples of the 0.25-point MNQ tick size. All accounts share the selected
+strategy and market feed.
 
 `enabled: false` prevents new entries while retaining position reconciliation,
 protective/trailing stop management, and strategy exits. Keep an account in the

@@ -633,13 +633,77 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(api.open_orders_response, [])
 
-    def test_only_native_delayed_execution_mode_is_supported(self) -> None:
+    def test_invalid_trailing_mode_is_rejected(self) -> None:
         manager = ExecutionManager(
             FakeApi(), ACCOUNT, CONTRACT,
             config(trail_management_mode="hard_stop_only"),
         )
         self.assertIn(
-            "TRAIL_MANAGEMENT_MODE must be native_delayed",
+            "TRAIL_MANAGEMENT_MODE must be native_delayed or fixed_oco",
+            manager.readiness_errors(),
+        )
+
+    def test_fixed_oco_mode_keeps_stop_and_take_profit_without_trailing(self) -> None:
+        manager = ExecutionManager(
+            FakeApi(), ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                stop_loss_points=Decimal("40"),
+                take_profit_points=Decimal("25"),
+            ),
+        )
+
+        self.assertEqual(manager.readiness_errors(), [])
+        payload = manager.build_entry_payload(0, "fixed-oco")
+        self.assertEqual(payload["stopLossBracket"], {"ticks": -160, "type": 4})
+        self.assertEqual(payload["takeProfitBracket"], {"ticks": 100, "type": 1})
+
+        manager.last_positions = [position(LONG_POSITION, 100)]
+        manager.confirmed_position_id = 11
+        manager.confirmed_stop_order_id = 61
+        manager.observe_live_price({"lastPrice": 200})
+        self.assertIsNone(manager.live_trailing_latched_position_id)
+
+    async def test_fixed_oco_monitor_does_not_submit_trailing_order(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        hard_stop = stop(61, 1, 60)
+        take_profit = {
+            "id": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "creationTimestamp": "2026-10-14T14:54:02.600Z",
+            "type": 1,
+            "side": 1,
+            "size": 1,
+            "limitPrice": 125,
+            "status": 1,
+        }
+        api.positions_response = [pos]
+        api.open_orders_response = [hard_stop, take_profit]
+        manager = ExecutionManager(
+            api, ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                stop_loss_points=Decimal("40"),
+                take_profit_points=Decimal("25"),
+                daily_loss_limit_enabled=False,
+            ),
+        )
+        manager.activate_native_trailing = AsyncMock()
+
+        self.assertEqual(await manager.monitor_once(), "FIXED_OCO_ACTIVE")
+        manager.activate_native_trailing.assert_not_awaited()
+        self.assertEqual(api.place_calls, [])
+
+    def test_fixed_oco_mode_requires_take_profit(self) -> None:
+        manager = ExecutionManager(
+            FakeApi(), ACCOUNT, CONTRACT,
+            config(trail_management_mode="fixed_oco", take_profit_points=None),
+        )
+
+        self.assertIn(
+            "fixed Auto OCO exits require a take profit",
             manager.readiness_errors(),
         )
 

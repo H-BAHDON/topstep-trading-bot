@@ -153,6 +153,8 @@ def load_account_configuration(path: Path) -> list[dict]:
                 raise ValueError("contracts must be a positive integer")
             if "daily_loss_limit_enabled" in account and type(account["daily_loss_limit_enabled"]) is not bool:
                 raise ValueError("daily_loss_limit_enabled must be a boolean")
+            if "trailing_enabled" in account and type(account["trailing_enabled"]) is not bool:
+                raise ValueError("trailing_enabled must be a boolean")
             if "max_daily_loss_usd" in account:
                 limit = Decimal(str(account["max_daily_loss_usd"]))
                 if not limit.is_finite() or limit <= 0:
@@ -201,6 +203,10 @@ def configured_accounts() -> list[dict]:
 
 def account_trading_config(base: TradingConfig, settings: dict) -> TradingConfig:
     changes = {key: settings[key] for key in ("contracts", "daily_loss_limit_enabled") if key in settings}
+    if "trailing_enabled" in settings:
+        changes["trail_management_mode"] = (
+            "native_delayed" if settings["trailing_enabled"] else "fixed_oco"
+        )
     if "max_daily_loss_usd" in settings:
         changes["max_daily_loss_usd"] = Decimal(str(settings["max_daily_loss_usd"]))
     if "stop_loss_points" in settings:

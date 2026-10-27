@@ -71,6 +71,7 @@ class AccountConfigurationTests(unittest.TestCase):
             {'enabled': 'false'}, {'name': ''}, {'account_name': ''},
             {'account_type': 'live'}, {'contracts': True}, {'contracts': 0},
             {'contracts': 1.5}, {'daily_loss_limit_enabled': 'false'},
+            {'trailing_enabled': 'false'},
             {'max_daily_loss_usd': 'NaN'}, {'max_daily_loss_usd': -1},
             {'max_daily_loss_usd': 'Infinity'}, {'max_daily_loss_usd': True},
             {'stop_loss_points': 'NaN'}, {'stop_loss_points': 0},
@@ -112,6 +113,7 @@ class AccountConfigurationTests(unittest.TestCase):
             max_daily_loss_usd='50.25',
             stop_loss_points='40',
             take_profit_points='25',
+            trailing_enabled=False,
             trail_activation_points='10',
             trail_distance_points='1.75',
         ))
@@ -122,6 +124,8 @@ class AccountConfigurationTests(unittest.TestCase):
         self.assertTrue(first.daily_loss_limit_enabled)
         self.assertEqual(first.stop_loss_points, Decimal('40'))
         self.assertEqual(first.take_profit_points, Decimal('25'))
+        self.assertEqual(first.trail_management_mode, 'fixed_oco')
+        self.assertEqual(second.trail_management_mode, base.trail_management_mode)
         self.assertEqual(first.trail_activation_points, Decimal('10'))
         self.assertEqual(first.trail_distance_ticks, 7)
         self.assertEqual(second.trail_activation_points, base.trail_activation_points)
