@@ -696,6 +696,201 @@ class ExecutionTests(unittest.IsolatedAsyncioTestCase):
         manager.activate_native_trailing.assert_not_awaited()
         self.assertEqual(api.place_calls, [])
 
+    async def test_transient_missing_bracket_recovers_without_halt(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        hard_stop = stop(61, 1, 60)
+        take_profit = {
+            "id": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "type": 1,
+            "side": 1,
+            "size": 1,
+            "limitPrice": 115,
+            "status": 1,
+        }
+        api.open_positions_sequence = [[pos], [pos]]
+        api.open_orders_sequence = [[], [hard_stop, take_profit]]
+        manager = ExecutionManager(
+            api, ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                take_profit_points=Decimal("15"),
+                daily_loss_limit_enabled=False,
+            ),
+        )
+
+        with patch("execution.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            outcome = await manager.monitor_once()
+
+        self.assertEqual(outcome, "FIXED_OCO_ACTIVE")
+        self.assertIsNone(manager.halted_reason)
+        self.assertEqual(manager.confirmed_stop_order_id, 61)
+        self.assertEqual(manager.confirmed_take_profit_order_id, 62)
+        sleep_mock.assert_awaited_once_with(0.25)
+
+    async def test_transient_missing_bracket_then_flat_records_closure(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        filled_target = {
+            "id": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "type": 1,
+            "side": 1,
+            "size": 1,
+            "limitPrice": 115,
+            "filledPrice": 115,
+            "status": 2,
+        }
+        api.open_positions_sequence = [[pos], [], []]
+        api.open_orders_sequence = [[], [], []]
+        api.orders_response = [filled_target]
+        api.trades_response = [{
+            "orderId": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "profitAndLoss": 30,
+            "fees": 1,
+            "voided": False,
+        }]
+        manager = ExecutionManager(
+            api, ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                take_profit_points=Decimal("15"),
+                daily_loss_limit_enabled=False,
+            ),
+        )
+        manager.last_positions = [pos]
+        manager.confirmed_position_id = 11
+        manager.confirmed_position_type = LONG_POSITION
+        manager.confirmed_position_size = 1
+        manager.confirmed_stop_order_id = 61
+        manager.confirmed_take_profit_order_id = 62
+
+        with patch("execution.asyncio.sleep", new=AsyncMock()):
+            outcome = await manager.monitor_once()
+
+        self.assertEqual(outcome, "POSITION_CLOSED")
+        self.assertIsNone(manager.halted_reason)
+        self.assertEqual(manager.last_positions, [])
+        self.assertEqual(manager.processed_exit_order_ids, {62})
+
+    async def test_persistent_missing_bracket_still_halts(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        api.open_positions_sequence = [[pos], [pos], [pos]]
+        api.open_orders_sequence = [[], [], []]
+        manager = ExecutionManager(
+            api, ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                take_profit_points=Decimal("15"),
+                daily_loss_limit_enabled=False,
+            ),
+        )
+
+        with patch("execution.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            outcome = await manager.monitor_once()
+
+        self.assertEqual(outcome, "PROTECTION_UNCERTAIN")
+        self.assertEqual(
+            manager.halted_code,
+            "PROTECTIVE_HARD_STOP_MISSING_OR_AMBIGUOUS",
+        )
+        self.assertEqual(sleep_mock.await_count, 2)
+
+    async def test_confirmed_closure_clears_only_protection_scoped_halt(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        filled_target = {
+            "id": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "type": 1,
+            "side": 1,
+            "size": 1,
+            "limitPrice": 115,
+            "filledPrice": 115,
+            "status": 2,
+        }
+        api.orders_response = [filled_target]
+        api.trades_response = [{
+            "orderId": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "profitAndLoss": 30,
+            "fees": 1,
+            "voided": False,
+        }]
+        manager = ExecutionManager(
+            api, ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                take_profit_points=Decimal("15"),
+                daily_loss_limit_enabled=False,
+            ),
+        )
+        manager.last_positions = [pos]
+        manager.confirmed_position_id = 11
+        manager.confirmed_position_type = LONG_POSITION
+        manager.confirmed_position_size = 1
+        manager.confirmed_stop_order_id = 61
+        manager.confirmed_take_profit_order_id = 62
+        manager.halt("protective hard stop missing or ambiguous")
+
+        outcome = await manager.monitor_once()
+
+        self.assertEqual(outcome, "POSITION_CLOSED")
+        self.assertIsNone(manager.halted_reason)
+        self.assertIsNone(manager.halted_code)
+
+    async def test_confirmed_closure_preserves_unrelated_halt(self) -> None:
+        api = FakeApi()
+        pos = position(LONG_POSITION, 100)
+        api.orders_response = [{
+            "id": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "type": 1,
+            "side": 1,
+            "size": 1,
+            "limitPrice": 115,
+            "filledPrice": 115,
+            "status": 2,
+        }]
+        api.trades_response = [{
+            "orderId": 62,
+            "accountId": ACCOUNT["id"],
+            "contractId": CONTRACT["id"],
+            "profitAndLoss": 30,
+            "fees": 1,
+            "voided": False,
+        }]
+        manager = ExecutionManager(
+            api, ACCOUNT, CONTRACT,
+            config(
+                trail_management_mode="fixed_oco",
+                take_profit_points=Decimal("15"),
+                daily_loss_limit_enabled=False,
+            ),
+        )
+        manager.last_positions = [pos]
+        manager.confirmed_position_id = 11
+        manager.confirmed_position_type = LONG_POSITION
+        manager.confirmed_position_size = 1
+        manager.confirmed_stop_order_id = 61
+        manager.confirmed_take_profit_order_id = 62
+        manager.halt("daily net P&L limit reached (-100.00 USD)")
+
+        outcome = await manager.monitor_once()
+
+        self.assertEqual(outcome, "POSITION_CLOSED")
+        self.assertEqual(manager.halted_code, "DAILY_LOSS_LIMIT_REACHED")
+        self.assertIsNotNone(manager.halted_reason)
+
     def test_fixed_oco_mode_requires_take_profit(self) -> None:
         manager = ExecutionManager(
             FakeApi(), ACCOUNT, CONTRACT,

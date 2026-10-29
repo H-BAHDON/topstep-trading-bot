@@ -27,6 +27,8 @@ ENTRY_SIGNALS = {
     "SHORT_HOURLY": 1,
     "LONG_HOURLY_43": 0,
     "SHORT_HOURLY_43": 1,
+    "LONG_HOURLY_44": 0,
+    "SHORT_HOURLY_44": 1,
     "LONG_HOURLY_55": 0,
     "SHORT_HOURLY_55": 1,
 }
@@ -38,6 +40,10 @@ SHORT_POSITION = 2
 LIMIT_ORDER = 1
 STOP_ORDER = 4
 TRAILING_STOP_ORDER = 5
+POSITION_SCOPED_PROTECTION_HALT_CODES = {
+    "PROTECTIVE_HARD_STOP_MISSING_OR_AMBIGUOUS",
+    "PROTECTIVE_TAKE_PROFIT_MISSING_OR_AMBIGUOUS",
+}
 POSITION_BRACKETS_API_UNSUPPORTED = (
     "BRACKET_MODE=position is blocked: the immediate API hard-stop bracket "
     "requires Auto OCO mode; ProjectX rejects bracket fields in Position mode"
@@ -177,6 +183,7 @@ class TradingConfig:
         elif strategy_name in {
             "ema12_hourly_trailing",
             "ema12_hourly_trailing_43",
+            "ema12_hourly_trailing_44",
             "ema12_hourly_trailing_55",
         }:
             def strategy_integer(name: str, default: str) -> int:
@@ -343,6 +350,8 @@ class ExecutionManager:
         self.processed_exit_order_ids: set[int] = set()
         self.cancel_verify_attempts = 3
         self.cancel_verify_delay_seconds = 0.25
+        self.protection_snapshot_confirm_attempts = 2
+        self.protection_snapshot_confirm_delay_seconds = 0.25
         self.stop_ticks = self.points_to_ticks(config.stop_loss_points)
         self.take_profit_ticks = (
             self.points_to_ticks(config.take_profit_points)
@@ -1067,6 +1076,7 @@ class ExecutionManager:
         *,
         entry_eligible: bool,
         market_fresh: bool,
+        immediate: bool = False,
         preparation_batch: EntryPreparationBatch | None = None,
         signal_received_monotonic: float | None = None,
     ) -> str | PreparedEntry:
@@ -1178,18 +1188,33 @@ class ExecutionManager:
                 return "ACCOUNT_PAUSED"
             if self.order_pending:
                 return "PENDING_BLOCKED"
-            try:
-                positions, open_orders = await self.reconcile(priority=True)
-                net = (
-                    await self.daily_net_pnl(priority=True)
-                    if self.config.daily_loss_limit_enabled
-                    else self.realized_net
+            if immediate:
+                # The :43 strategy is latency-sensitive.  Its broker position,
+                # open-order and history reads are deliberately deferred to the
+                # existing post-submit verification/recovery path.  Keep the
+                # process-local lock, pending latch, candle de-duplication and
+                # broker-side OCO brackets around the mutation itself.
+                positions: list[dict[str, Any]] = []
+                open_orders: list[dict[str, Any]] = []
+                net = self.realized_net
+                logging.warning(
+                    "IMMEDIATE ENTRY FAST PATH accountId=%s signal=%s "
+                    "brokerPositionOrderHistoryChecks=DEFERRED",
+                    self.account["id"], result.signal,
                 )
-                if preparation_batch is not None:
-                    await preparation_batch.state_snapshot_complete(self)
-            except Exception as exc:
-                self.halt(f"pre-entry reconciliation failed: {type(exc).__name__}")
-                return "UNCERTAIN_BLOCKED"
+            else:
+                try:
+                    positions, open_orders = await self.reconcile(priority=True)
+                    net = (
+                        await self.daily_net_pnl(priority=True)
+                        if self.config.daily_loss_limit_enabled
+                        else self.realized_net
+                    )
+                    if preparation_batch is not None:
+                        await preparation_batch.state_snapshot_complete(self)
+                except Exception as exc:
+                    self.halt(f"pre-entry reconciliation failed: {type(exc).__name__}")
+                    return "UNCERTAIN_BLOCKED"
             if (
                 self.config.daily_loss_limit_enabled
                 and net <= -self.config.max_daily_loss_usd
@@ -1219,13 +1244,14 @@ class ExecutionManager:
                 return "ORDER_EXISTS"
 
             tag = self.custom_tag(result)
-            existing = await self.api.orders(
-                int(self.account["id"]), self.trading_day_start(), priority=True
-            )
-            for record in existing:
-                self.validate_record_account(record)
-            if any(order.get("customTag") == tag for order in existing):
-                return "DUPLICATE_BLOCKED"
+            if not immediate:
+                existing = await self.api.orders(
+                    int(self.account["id"]), self.trading_day_start(), priority=True
+                )
+                for record in existing:
+                    self.validate_record_account(record)
+                if any(order.get("customTag") == tag for order in existing):
+                    return "DUPLICATE_BLOCKED"
 
             side = ENTRY_SIGNALS[result.signal]
             try:
@@ -2223,6 +2249,84 @@ class ExecutionManager:
                         self.lock.release()
                 raise
 
+    async def _handle_confirmed_position_closure(self) -> str:
+        """Confirm and record a position transition before clearing its state."""
+        account_id = int(self.account["id"])
+        confirmation_positions = await self.api.open_positions(account_id)
+        confirmed_mnq_positions, _ = self.mnq_state(
+            confirmation_positions, []
+        )
+        if confirmed_mnq_positions:
+            self.last_positions = confirmed_mnq_positions
+            logging.info(
+                "POSITION CLOSURE NOT YET CONFIRMED positionId=%s",
+                self.confirmed_position_id,
+            )
+            return "POSITION_CLOSURE_NOT_CONFIRMED"
+
+        fresh_open_orders = await self.api.open_orders(account_id)
+        _, fresh_mnq_orders = self.mnq_state([], fresh_open_orders)
+        logging.info(
+            "POSITION CLOSURE CONFIRMED positionId=%s "
+            "trackedHardStopOrderId=%s trackedTakeProfitOrderId=%s "
+            "trackedTrailingOrderId=%s "
+            "freshOpenOrderIds=%s",
+            self.confirmed_position_id,
+            self.confirmed_stop_order_id,
+            self.confirmed_take_profit_order_id,
+            self.native_trailing_order_id,
+            [order.get("id") for order in fresh_mnq_orders],
+        )
+        if not await self.cancel_and_confirm_orphan_exits(fresh_mnq_orders):
+            return "ORPHAN_CANCELLATION_UNCERTAIN"
+        closure_confirmed = await self.log_position_closure()
+        self.confirmed_stop_price = None
+        self.confirmed_stop_order_id = None
+        self.confirmed_take_profit_order_id = None
+        closed_position_id = self.confirmed_position_id
+        self.native_trailing_order_id = None
+        self.native_trailing_active = False
+        self.trailing_attempted_position_id = None
+        self.live_trailing_latched_position_id = None
+        self.locally_opened_position_id = None
+        self.confirmed_position_id = None
+        self.confirmed_position_type = None
+        self.confirmed_position_size = None
+        if not closure_confirmed:
+            self.halt("position closed but broker-side exit could not be confirmed")
+            return "CLOSURE_UNCONFIRMED"
+        if self.trailing_distance_mismatch_position_id == closed_position_id:
+            logging.info(
+                "NATIVE TRAILING DISTANCE MISMATCH RESOLVED "
+                "positionId=%s requestedDistance=%s actualDistance=%s "
+                "positionClosed=True remainingOrdersResolved=True",
+                closed_position_id,
+                self.trailing_requested_distance,
+                self.trailing_actual_distance,
+            )
+            self.trailing_distance_mismatch_position_id = None
+            self.trailing_requested_distance = None
+            self.trailing_actual_distance = None
+        position_scoped_halt = (
+            self.halted_reason
+            and (
+                self.halted_reason.startswith(
+                    "native trailing distance mismatch:"
+                )
+                or self.halted_code in POSITION_SCOPED_PROTECTION_HALT_CODES
+            )
+        )
+        if position_scoped_halt:
+            logging.info(
+                "POSITION-SCOPED HALT CLEARED positionId=%s reason=%s",
+                closed_position_id,
+                self.halted_code,
+            )
+            self.halted_reason = None
+            self.halted_code = None
+        self.last_positions = []
+        return "POSITION_CLOSED"
+
     async def _monitor_once_locked(self) -> str:
         if self.order_pending:
             return "ENTRY_VERIFICATION_PENDING"
@@ -2238,117 +2342,74 @@ class ExecutionManager:
             if net <= -self.config.max_daily_loss_usd:
                 self.halt(f"daily net P&L limit reached ({net:.2f} USD)")
         if previous_had_position and not positions:
-            account_id = int(self.account["id"])
-            confirmation_positions = await self.api.open_positions(account_id)
-            confirmed_mnq_positions, _ = self.mnq_state(
-                confirmation_positions, []
-            )
-            if confirmed_mnq_positions:
-                self.last_positions = confirmed_mnq_positions
-                logging.info(
-                    "POSITION CLOSURE NOT YET CONFIRMED positionId=%s",
-                    self.confirmed_position_id,
-                )
-                return "POSITION_CLOSURE_NOT_CONFIRMED"
-
-            fresh_open_orders = await self.api.open_orders(account_id)
-            _, fresh_mnq_orders = self.mnq_state([], fresh_open_orders)
-            logging.info(
-                "POSITION CLOSURE CONFIRMED positionId=%s "
-                "trackedHardStopOrderId=%s trackedTakeProfitOrderId=%s "
-                "trackedTrailingOrderId=%s "
-                "freshOpenOrderIds=%s",
-                self.confirmed_position_id,
-                self.confirmed_stop_order_id,
-                self.confirmed_take_profit_order_id,
-                self.native_trailing_order_id,
-                [order.get("id") for order in fresh_mnq_orders],
-            )
-            if not await self.cancel_and_confirm_orphan_exits(
-                fresh_mnq_orders
-            ):
-                return "ORPHAN_CANCELLATION_UNCERTAIN"
-            try:
-                closure_confirmed = await self.log_position_closure()
-            except Exception:
-                raise
-            self.confirmed_stop_price = None
-            self.confirmed_stop_order_id = None
-            self.confirmed_take_profit_order_id = None
-            closed_position_id = self.confirmed_position_id
-            self.native_trailing_order_id = None
-            self.native_trailing_active = False
-            self.trailing_attempted_position_id = None
-            self.live_trailing_latched_position_id = None
-            self.locally_opened_position_id = None
-            self.confirmed_position_id = None
-            self.confirmed_position_type = None
-            self.confirmed_position_size = None
-            if not closure_confirmed:
-                self.halt("position closed but broker-side exit could not be confirmed")
-                return "CLOSURE_UNCONFIRMED"
-            if (
-                self.trailing_distance_mismatch_position_id
-                == closed_position_id
-            ):
-                logging.info(
-                    "NATIVE TRAILING DISTANCE MISMATCH RESOLVED "
-                    "positionId=%s requestedDistance=%s actualDistance=%s "
-                    "positionClosed=True remainingOrdersResolved=True",
-                    closed_position_id,
-                    self.trailing_requested_distance,
-                    self.trailing_actual_distance,
-                )
-                self.trailing_distance_mismatch_position_id = None
-                self.trailing_requested_distance = None
-                self.trailing_actual_distance = None
-            if (
-                self.halted_reason
-                and self.halted_reason.startswith(
-                    "native trailing distance mismatch:"
-                )
-            ):
-                logging.info(
-                    "POSITION-SCOPED HALT CLEARED positionId=%s reason=%s",
-                    closed_position_id,
-                    self.halted_code,
-                )
-                self.halted_reason = None
-                self.halted_code = None
-            self.last_positions = []
-            return "POSITION_CLOSED"
+            return await self._handle_confirmed_position_closure()
         if positions:
-            if len(positions) != 1:
-                self.halt("unexpected MNQ position count during monitoring")
-                return "POSITION_UNCERTAIN"
-            position = positions[0]
-            self.last_positions = [position]
-            size_mismatch = self.tracked_exit_quantity_mismatch(
-                position, orders
-            )
-            if size_mismatch is not None:
-                self.halt(
-                    "tracked protective exit quantity mismatch: "
-                    f"positionId={position.get('id')} "
-                    f"positionSize={position.get('size')} "
-                    f"orderId={size_mismatch.get('id')} "
-                    f"orderSize={size_mismatch.get('size')}"
+            for confirmation_attempt in range(
+                self.protection_snapshot_confirm_attempts + 1
+            ):
+                if not positions:
+                    return await self._handle_confirmed_position_closure()
+                if len(positions) != 1:
+                    self.halt("unexpected MNQ position count during monitoring")
+                    return "POSITION_UNCERTAIN"
+                position = positions[0]
+                self.last_positions = [position]
+                size_mismatch = self.tracked_exit_quantity_mismatch(
+                    position, orders
                 )
-                return "PROTECTIVE_EXIT_SIZE_MISMATCH"
-            stop = self.find_protective_stop(position, orders)
-            if stop is None:
-                self.halt("protective hard stop missing or ambiguous")
-                return "PROTECTION_UNCERTAIN"
+                if size_mismatch is not None:
+                    self.halt(
+                        "tracked protective exit quantity mismatch: "
+                        f"positionId={position.get('id')} "
+                        f"positionSize={position.get('size')} "
+                        f"orderId={size_mismatch.get('id')} "
+                        f"orderSize={size_mismatch.get('size')}"
+                    )
+                    return "PROTECTIVE_EXIT_SIZE_MISMATCH"
+                stop = self.find_protective_stop(position, orders)
+                take_profit = (
+                    self.find_take_profit(position, orders)
+                    if self.config.take_profit_points is not None
+                    else None
+                )
+                missing_reason = (
+                    "protective hard stop missing or ambiguous"
+                    if stop is None
+                    else "protective take profit missing or ambiguous"
+                    if (
+                        self.config.take_profit_points is not None
+                        and take_profit is None
+                    )
+                    else None
+                )
+                if missing_reason is None:
+                    break
+                if (
+                    confirmation_attempt
+                    >= self.protection_snapshot_confirm_attempts
+                ):
+                    self.halt(missing_reason)
+                    return "PROTECTION_UNCERTAIN"
+                logging.warning(
+                    "PROTECTION SNAPSHOT INCONSISTENT positionId=%s "
+                    "reason=%s confirmationAttempt=%d/%d; "
+                    "waiting for fresh broker position and order state",
+                    position.get("id"),
+                    self.halt_reason_code(missing_reason),
+                    confirmation_attempt + 1,
+                    self.protection_snapshot_confirm_attempts,
+                )
+                await asyncio.sleep(
+                    self.protection_snapshot_confirm_delay_seconds
+                )
+                positions, orders = await self.reconcile()
+
             self.confirmed_stop_order_id = int(stop["id"])
             self.confirmed_stop_price = Decimal(str(stop["stopPrice"]))
             self.confirmed_position_id = int(position["id"])
             self.confirmed_position_type = int(position["type"])
             self.confirmed_position_size = int(position["size"])
             if self.config.take_profit_points is not None:
-                take_profit = self.find_take_profit(position, orders)
-                if take_profit is None:
-                    self.halt("protective take profit missing or ambiguous")
-                    return "PROTECTION_UNCERTAIN"
                 self.confirmed_take_profit_order_id = int(take_profit["id"])
                 if self.config.trail_management_mode == "fixed_oco":
                     return "FIXED_OCO_ACTIVE"

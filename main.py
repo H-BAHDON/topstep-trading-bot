@@ -23,6 +23,7 @@ from strategies.base import StrategyResult
 from strategies.test_long import TestLongStrategy
 from strategies.ema12_hourly_trailing import Ema12HourlyTrailingStrategy, HourlyEmaResult
 from strategies.ema12_hourly_trailing_43 import Ema12HourlyTrailing43Strategy
+from strategies.ema12_hourly_trailing_44 import Ema12HourlyTrailing44Strategy
 from strategies.ema12_hourly_trailing_55 import Ema12HourlyTrailing55Strategy
 from telegram_monitor import AccountTelegramMonitor, PauseStateStore
 from topstep_api import MarketDataFeed, ProjectX, ProjectXError, env_bool
@@ -55,6 +56,7 @@ STRATEGIES = {
     "test_long": TestLongStrategy,
     "ema12_hourly_trailing": Ema12HourlyTrailingStrategy,
     "ema12_hourly_trailing_43": Ema12HourlyTrailing43Strategy,
+    "ema12_hourly_trailing_44": Ema12HourlyTrailing44Strategy,
     "ema12_hourly_trailing_55": Ema12HourlyTrailing55Strategy,
 }
 
@@ -69,6 +71,7 @@ def select_strategy(name: str, entry_mode: str | None = None):
     if strategy_class in {
         Ema12HourlyTrailingStrategy,
         Ema12HourlyTrailing43Strategy,
+        Ema12HourlyTrailing44Strategy,
         Ema12HourlyTrailing55Strategy,
     }:
         try:
@@ -253,7 +256,9 @@ async def verify_configured_account(api: ProjectX, accounts: list[dict], setting
     return account
 
 
-async def dispatch_signal(executions: list[ExecutionManager], result, **kwargs) -> dict[int, str]:
+async def dispatch_signal(
+    executions: list[ExecutionManager], result, *, immediate: bool = False, **kwargs
+) -> dict[int, str]:
     loop = asyncio.get_running_loop()
     signal_received = loop.time()
     logging.info(
@@ -267,6 +272,7 @@ async def dispatch_signal(executions: list[ExecutionManager], result, **kwargs) 
         try:
             outcome = await execution.prepare_entry(
                 result,
+                immediate=immediate,
                 preparation_batch=preparation_batch,
                 signal_received_monotonic=signal_received,
                 **kwargs,
@@ -520,7 +526,9 @@ async def async_main() -> None:
             telegram.pause_store = pause_store
         await asyncio.gather(*(execution.startup_check() for execution in executions))
 
-        async def on_closed_candle(candle, entry_eligible: bool) -> None:
+        async def on_closed_candle(
+            candle, entry_eligible: bool, immediate: bool = False
+        ) -> None:
             if isinstance(strategy, TestLongStrategy):
                 result = strategy.on_candle(
                     candle,
@@ -540,6 +548,10 @@ async def async_main() -> None:
                 return
             statuses = await dispatch_signal(
                 executions, result,
+                immediate=(
+                    immediate
+                    and result.signal in {"LONG_HOURLY_43", "SHORT_HOURLY_43"}
+                ),
                 entry_eligible=entry_eligible,
                 market_fresh=feed.market_is_fresh(),
             )

@@ -144,6 +144,41 @@ class MarketPayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(observed), 1)
         self.assertEqual(observed[0]['lastPrice'], 25000.25)
 
+    async def test_first_trade_of_new_minute_dispatches_completed_live_candle(self):
+        feed = MarketDataFeed(Mock(), {'id': 'MNQ'}, False)
+        handler = AsyncMock()
+
+        await feed.update_live_candle({
+            'timestamp': '2026-10-28T18:42:10Z',
+            'price': 29990.00,
+            'volume': 1,
+        }, on_closed_candle=handler)
+        await feed.update_live_candle({
+            'timestamp': '2026-10-28T18:42:59.900Z',
+            'price': 29992.50,
+            'volume': 1,
+        }, on_closed_candle=handler)
+        await feed.update_live_candle({
+            'timestamp': '2026-10-28T18:43:00.010Z',
+            'price': 29993.00,
+            'volume': 1,
+        }, on_closed_candle=handler)
+        await asyncio.gather(*feed.live_candle_tasks)
+
+        handler.assert_awaited_once()
+        candle, entry_eligible, immediate = handler.await_args.args
+        self.assertEqual(candle.time.isoformat(), '2026-10-28T18:42:00+00:00')
+        self.assertEqual(candle.close, 29992.50)
+        self.assertTrue(entry_eligible)
+        self.assertTrue(immediate)
+
+        await feed.update_live_candle({
+            'timestamp': '2026-10-28T18:43:01Z',
+            'price': 29993.25,
+            'volume': 1,
+        }, on_closed_candle=handler)
+        handler.assert_awaited_once()
+
     async def test_invalid_fields_are_still_rejected(self):
         for field in ({'price': True}, {'volume': True}, {'timestamp': True}, {'price': 'NaN'}, {'timestamp': 'bad'}):
             feed = MarketDataFeed(Mock(), {'id': 'MNQ'}, False)

@@ -24,7 +24,7 @@ USER_HUB = "wss://rtc.topstepx.com/hubs/user"
 RECORD_SEPARATOR = "\x1e"
 MNQ_SYMBOL = "F.US.MNQ"
 UTC = timezone.utc
-ClosedCandleHandler = Callable[["Candle", bool], Awaitable[None]]
+ClosedCandleHandler = Callable[["Candle", bool, bool], Awaitable[None]]
 LivePriceHandler = Callable[[dict[str, Any]], Any]
 
 
@@ -557,6 +557,7 @@ class MarketDataFeed:
         self.max_seen_trades = 20_000
         self.unexpected_payload_count = 0
         self.live_price_handlers: list[LivePriceHandler] = []
+        self.live_candle_tasks: set[asyncio.Task[None]] = set()
 
     def add_live_price_handler(self, handler: LivePriceHandler) -> None:
         """Register a non-blocking observer for validated live prices."""
@@ -604,7 +605,7 @@ class MarketDataFeed:
             key=lambda candle: candle.time,
         )
         for candle in new_candles:
-            await on_closed_candle(candle, entry_eligible)
+            await on_closed_candle(candle, entry_eligible, False)
         if self.current is not None and self.current.time <= self.candles[-1].time:
             self.current = None
 
@@ -675,7 +676,11 @@ class MarketDataFeed:
         self.seen_trade_keys.add(key)
         return True
 
-    async def update_live_candle(self, trade: dict[str, Any]) -> None:
+    async def update_live_candle(
+        self,
+        trade: dict[str, Any],
+        on_closed_candle: ClosedCandleHandler | None = None,
+    ) -> None:
         try:
             raw_price = trade.get("price")
             raw_time = trade.get("timestamp")
@@ -714,7 +719,9 @@ class MarketDataFeed:
         self.last_price = price
         self.last_market_update = now_utc()
         self.publish_live_price(price, trade_time)
+        completed = None
         if self.current is None or bucket > self.current.time:
+            completed = self.current
             self.current = Candle(bucket, price, price, price, price, size)
         elif bucket == self.current.time:
             self.current = Candle(
@@ -729,6 +736,40 @@ class MarketDataFeed:
             logging.debug("Ignoring out-of-order trade for %s", bucket)
             return
 
+        if (
+            completed is not None
+            and on_closed_candle is not None
+            and (not self.candles or completed.time > self.candles[-1].time)
+        ):
+            # A trade in the new minute proves that the prior live minute has
+            # closed.  Emit it immediately instead of waiting for the REST bar
+            # endpoint's next minute-cycle.  REST reconciliation remains a
+            # recovery/backfill source and will ignore this timestamp.
+            self.candles.append(completed)
+            logging.info(
+                "LIVE CANDLE CLOSED candle=%s nextTrade=%s dispatch=IMMEDIATE",
+                completed.time.isoformat(), trade_time.isoformat(),
+            )
+            task = asyncio.create_task(
+                on_closed_candle(completed, True, True),
+                name=f"live-candle-{completed.time.isoformat()}",
+            )
+            self.live_candle_tasks.add(task)
+
+            def completed_callback(done: asyncio.Task[None]) -> None:
+                self.live_candle_tasks.discard(done)
+                if done.cancelled():
+                    return
+                try:
+                    done.result()
+                except Exception:
+                    logging.exception(
+                        "Immediate live-candle dispatch failed candle=%s",
+                        completed.time.isoformat(),
+                    )
+
+            task.add_done_callback(completed_callback)
+
         logging.debug(
             "MNQ tick timestamp=%s price=%.2f currentOHLC=%.2f/%.2f/%.2f/%.2f volume=%.0f",
             trade_time.isoformat().replace("+00:00", "Z"),
@@ -740,7 +781,7 @@ class MarketDataFeed:
             self.current.volume,
         )
 
-    async def stream_once(self) -> None:
+    async def stream_once(self, on_closed_candle: ClosedCandleHandler) -> None:
         if not self.api.token:
             raise ProjectXError("Cannot connect market stream without a session token")
         url = (
@@ -834,7 +875,9 @@ class MarketDataFeed:
                     elif target == "GatewayTrade" and len(arguments) >= 2:
                         for trade in self.individual_trades(arguments[1]):
                             try:
-                                await self.update_live_candle(trade)
+                                await self.update_live_candle(
+                                    trade, on_closed_candle=on_closed_candle
+                                )
                             except Exception:
                                 logging.exception(
                                     "Ignoring unexpected GatewayTrade processing error"
@@ -850,7 +893,7 @@ class MarketDataFeed:
         backoff = 1.0
         while not self.stop.is_set():
             try:
-                await self.stream_once()
+                await self.stream_once(on_closed_candle)
                 self.connected = False
                 backoff = 1.0
             except asyncio.CancelledError:

@@ -135,6 +135,43 @@ class AccountConfigurationTests(unittest.TestCase):
 
 
 class MultiAccountExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_immediate_43_entry_submits_before_broker_state_reads(self):
+        candidate = manager(
+            daily_loss_limit_enabled=False,
+            strategy_name='ema12_hourly_trailing_43',
+            take_profit_points=Decimal('10'),
+        )
+        candidate.api.open_positions = AsyncMock(
+            side_effect=AssertionError('pre-entry position read must be deferred')
+        )
+        candidate.api.open_orders = AsyncMock(
+            side_effect=AssertionError('pre-entry order read must be deferred')
+        )
+        candidate.api.orders = AsyncMock(
+            side_effect=AssertionError('pre-entry history read must be deferred')
+        )
+        candidate.api.place_order_once = AsyncMock(return_value={
+            'success': False,
+            'errorCode': 2,
+            'errorMessage': 'mock rejection',
+            'orderId': 9001,
+        })
+
+        statuses = await dispatch_signal(
+            [candidate], signal_result('LONG_HOURLY_43'),
+            immediate=True, entry_eligible=True, market_fresh=True,
+        )
+
+        self.assertEqual(statuses[candidate.account['id']], 'ORDER_REJECTED')
+        candidate.api.place_order_once.assert_awaited_once()
+        payload = candidate.api.place_order_once.await_args.args[0]
+        self.assertEqual(payload['side'], 0)
+        self.assertEqual(payload['stopLossBracket']['type'], 4)
+        self.assertEqual(payload['takeProfitBracket']['type'], 1)
+        candidate.api.open_positions.assert_not_awaited()
+        candidate.api.open_orders.assert_not_awaited()
+        candidate.api.orders.assert_not_awaited()
+
     async def test_simulated_next_signal_entry_ack_and_trailing_timeline(self):
         api = FakeApi()
         first = manager(
